@@ -120,6 +120,7 @@ def scheduled_post(db, user, workspace, social_account):
         title="Parity title",
         caption="Parity caption",
         first_comment="Parity first comment",
+        internal_notes="Parity internal note",
         scheduled_at=when,
     )
     PlatformPost.objects.create(
@@ -178,6 +179,40 @@ class TestRestMcpPostParity:
         assert "created_at" in body
         assert "updated_at" in body
         assert body["platform_posts"][0]["platform_post_id"] == "upstream-abc-123"
+
+    def test_internal_notes_round_trips_through_mcp_create_draft(self, client_with_token, social_account):
+        """internal_notes set via MCP ``create_draft`` must come back on the MCP
+        response *and* match what REST returns for the same post — proving the
+        field threads through the shared ``create_post`` service and
+        ``PostResponse`` rather than a surface-specific code path.
+        """
+        note = "Cleared with the client on the 2pm call."
+        mcp = client_with_token.post(
+            MCP_URL,
+            data=json.dumps(
+                _rpc(
+                    "tools/call",
+                    {
+                        "name": "create_draft",
+                        "arguments": {
+                            "social_account_id": str(social_account.id),
+                            "caption": "draft with a note",
+                            "internal_notes": note,
+                        },
+                    },
+                )
+            ),
+            content_type="application/json",
+        )
+        assert mcp.status_code == 200
+        envelope = mcp.json()
+        assert "error" not in envelope, envelope
+        mcp_body = json.loads(envelope["result"]["content"][0]["text"])
+        assert mcp_body["internal_notes"] == note
+
+        rest = client_with_token.get(f"/api/v1/posts/{mcp_body['id']}")
+        assert rest.status_code == 200, rest.content
+        assert rest.json()["internal_notes"] == note
 
     def test_mcp_scheduled_at_uses_z_suffix_for_utc(self, client_with_token, scheduled_post):
         """Gap 5: MCP used to emit ``+00:00``; both surfaces now emit ``Z``."""
@@ -383,3 +418,146 @@ class TestMcpAnalyticsPermissionGate:
         body = mcp.json()
         assert "error" in body, body
         assert "permission denied" in body["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# proposed_publish_at — create_draft carries it; every post payload returns it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestProposedPublishAtMcp:
+    _WHEN = "2027-09-01T09:00:00Z"
+
+    def _call(self, client, name, arguments):
+        resp = client.post(
+            MCP_URL,
+            data=json.dumps(_rpc("tools/call", {"name": name, "arguments": arguments})),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200, resp.content
+        envelope = resp.json()
+        assert "error" not in envelope, envelope
+        return json.loads(envelope["result"]["content"][0]["text"])
+
+    def test_create_draft_with_proposed_round_trips_through_get_post(self, client_with_token, social_account):
+        created = self._call(
+            client_with_token,
+            "create_draft",
+            {
+                "social_account_id": str(social_account.id),
+                "caption": "hi",
+                "proposed_publish_at": self._WHEN,
+            },
+        )
+        assert created["proposed_publish_at"] == self._WHEN
+        fetched = self._call(client_with_token, "get_post", {"post_id": created["id"]})
+        assert fetched["proposed_publish_at"] == self._WHEN
+
+    def test_create_draft_without_proposed_is_null(self, client_with_token, social_account):
+        created = self._call(
+            client_with_token,
+            "create_draft",
+            {"social_account_id": str(social_account.id), "caption": "hi"},
+        )
+        assert created["proposed_publish_at"] is None
+
+    def test_schedule_draft_clears_proposed(self, client_with_token, social_account):
+        created = self._call(
+            client_with_token,
+            "create_draft",
+            {"social_account_id": str(social_account.id), "caption": "hi", "proposed_publish_at": self._WHEN},
+        )
+        assert created["proposed_publish_at"] == self._WHEN
+        when = (timezone.now() + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        scheduled = self._call(client_with_token, "schedule_draft", {"post_id": created["id"], "scheduled_at": when})
+        assert scheduled["scheduled_at"] is not None
+        assert scheduled["proposed_publish_at"] is None
+        fetched = self._call(client_with_token, "get_post", {"post_id": created["id"]})
+        assert fetched["proposed_publish_at"] is None
+
+    def test_create_draft_naive_proposed_stored_as_utc(self, client_with_token, social_account):
+        created = self._call(
+            client_with_token,
+            "create_draft",
+            {
+                "social_account_id": str(social_account.id),
+                "caption": "hi",
+                "proposed_publish_at": "2027-09-01T09:00:00",
+            },
+        )
+        # A tz-less value is interpreted as UTC and serialized with a Z suffix.
+        assert created["proposed_publish_at"] == "2027-09-01T09:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Inbox parity — REST /inbox and the MCP inbox tools share
+# ``InboxMessageResponse`` / ``InboxReplyResponse``, so payloads must match.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def inbox_message(db, workspace, social_account):
+    from apps.inbox.models import InboxMessage
+
+    return InboxMessage.objects.create(
+        workspace=workspace,
+        social_account=social_account,
+        platform_message_id="pm-parity-1",
+        message_type="comment",
+        sender_name="Commenter",
+        sender_handle="commenter",
+        body="Nice post!",
+        received_at=timezone.now() - timedelta(hours=1),
+    )
+
+
+@pytest.mark.django_db
+class TestRestMcpInboxParity:
+    def test_get_inbox_message_bodies_match(self, client_with_token, inbox_message):
+        from apps.inbox.models import InboxReply
+
+        InboxReply.objects.create(inbox_message=inbox_message, body="a draft reply")
+
+        rest = client_with_token.get(f"/api/v1/inbox/{inbox_message.id}")
+        assert rest.status_code == 200, rest.content
+        rest_body = rest.json()
+
+        mcp = client_with_token.post(
+            MCP_URL,
+            data=json.dumps(
+                _rpc(
+                    "tools/call",
+                    {"name": "get_inbox_message", "arguments": {"message_id": str(inbox_message.id)}},
+                )
+            ),
+            content_type="application/json",
+        )
+        assert mcp.status_code == 200
+        envelope = mcp.json()
+        assert "error" not in envelope, envelope
+        mcp_body = json.loads(envelope["result"]["content"][0]["text"])
+
+        assert mcp_body == rest_body, (
+            "MCP and REST disagree on the InboxMessageResponse payload. "
+            "Both surfaces must call InboxMessageResponse.from_message."
+        )
+
+    def test_list_inbox_messages_matches_rest_list(self, client_with_token, inbox_message):
+        from apps.inbox.models import InboxReply
+
+        InboxReply.objects.create(inbox_message=inbox_message, body="draft")
+
+        rest = client_with_token.get("/api/v1/inbox/")
+        assert rest.status_code == 200, rest.content
+        rest_body = rest.json()
+
+        mcp = client_with_token.post(
+            MCP_URL,
+            data=json.dumps(_rpc("tools/call", {"name": "list_inbox_messages", "arguments": {}})),
+            content_type="application/json",
+        )
+        assert mcp.status_code == 200
+        mcp_body = json.loads(mcp.json()["result"]["content"][0]["text"])
+
+        assert mcp_body == rest_body

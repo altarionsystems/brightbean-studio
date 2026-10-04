@@ -9,6 +9,8 @@ urlpatterns = [
     path("", views.calendar_view, name="calendar"),
     # Drag-and-drop reschedule
     path("reschedule/", views.reschedule_post, name="reschedule"),
+    # Bulk selection actions (floating bar): draft / delete / publish
+    path("bulk-action/", views.bulk_platform_action, name="bulk_platform_action"),
     # Posting slots
     path("posting-slots/", views.posting_slots, name="posting_slots"),
     path("posting-slots/save/", views.save_posting_slot, name="save_posting_slot"),
@@ -22,6 +24,16 @@ urlpatterns = [
     path("queues/<uuid:queue_id>/", views.queue_detail, name="queue_detail"),
     path("queues/<uuid:queue_id>/delete/", views.queue_delete, name="queue_delete"),
     path("queues/<uuid:queue_id>/reorder/", views.queue_reorder, name="queue_reorder"),
+    path(
+        "queues/<uuid:queue_id>/entries/<uuid:entry_id>/remove/",
+        views.queue_entry_remove,
+        name="queue_entry_remove",
+    ),
+    path(
+        "queues/<uuid:queue_id>/entries/<uuid:entry_id>/reslot/",
+        views.queue_entry_reslot,
+        name="queue_entry_reslot",
+    ),
     # Publish page tab partials (HTMX)
     path("publish/queue/", views.publish_tab_queue, name="publish_tab_queue"),
     path("publish/drafts/", views.publish_tab_drafts, name="publish_tab_drafts"),

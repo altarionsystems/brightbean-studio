@@ -119,7 +119,7 @@ class MastodonProvider(SocialProvider):
     # OAuth
     # ------------------------------------------------------------------
 
-    def get_auth_url(self, redirect_uri: str, state: str) -> str:
+    def get_auth_url(self, redirect_uri: str, state: str, code_verifier: str | None = None) -> str:
         """Build the instance-specific OAuth authorization URL."""
         params = {
             "client_id": self.credentials["client_id"],
@@ -130,7 +130,7 @@ class MastodonProvider(SocialProvider):
         }
         return f"{self.instance_url}/oauth/authorize?{urlencode(params)}"
 
-    def exchange_code(self, code: str, redirect_uri: str) -> OAuthTokens:
+    def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
         """Exchange an authorization code for a Mastodon access token."""
         resp = self._request(
             "POST",
@@ -376,7 +376,19 @@ class MastodonProvider(SocialProvider):
 
         return messages
 
-    def reply_to_message(self, access_token: str, message_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+    def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+        """Reply to a mention. Mastodon answers a notification's status, so this is the same call."""
+        return self.reply_to_message(access_token, comment_id, text, extra)
+
+    def reply_to_message(
+        self,
+        access_token: str,
+        message_id: str,
+        text: str,
+        extra: dict | None = None,
+        *,
+        human_agent: bool = False,
+    ) -> ReplyResult:
         """Reply to a notification's associated status."""
         # Get the notification to find the status ID
         resp = self._request(

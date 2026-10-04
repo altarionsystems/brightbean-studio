@@ -23,7 +23,7 @@
 
 ## About BrightBean Studio
 
-BrightBean Studio is an open-source, self-hostable social media management platform built for creators, agencies and SMBs. It does what Sendible, SocialPilot, or ContentStudio do, but free and without per-seat, per-channel, or per-workspace limits. Plan, compose, schedule, approve, publish, and monitor content across Facebook, Instagram, LinkedIn, TikTok, YouTube, Pinterest, Threads, Bluesky, Google Business Profile, and Mastodon from a single multi-workspace dashboard.
+BrightBean Studio is an open-source, self-hostable social media management platform built for creators, agencies and SMBs. It does what Sendible, SocialPilot, or ContentStudio do, but free and without per-seat, per-channel, or per-workspace limits. Plan, compose, schedule, approve, publish, and monitor content across Facebook, Instagram, LinkedIn, TikTok, YouTube, Pinterest, Threads, Bluesky, Google Business Profile, Mastodon, and DEV.to from a single multi-workspace dashboard.
 
 It's for people managing many client accounts under one roof who'd rather own their social stack than pay $100–300/month to a SaaS vendor. Every feature is available to every user. No paid tier, no feature gate, no upsell.
 
@@ -40,7 +40,7 @@ A free hosted version is available at [brightbean.xyz/studio](https://brightbean
 | **Approval workflows** | Configurable stages (none / optional / internal / internal + client), threaded internal & external comments, reminders, and a full audit trail. |
 | **Unified social inbox** | Comments, mentions, DMs, and reviews from every connected platform in one place, with sentiment analysis, assignments, threaded replies, and historical backfill. |
 | **Analytics** | Per-post and channel-level performance from every connected platform's native API, with KPI cards, 7/30/90-day trend charts, and a sortable all-posts table for views, engagement, follower growth, reach, and watch time. |
-| **Media library** | Org- and workspace-scoped libraries with nested folders, auto-generated platform-optimized variants, and alt text. |
+| **Media library** | Org- and workspace-scoped libraries with nested folders, auto-generated platform-optimized variants, alt text, and built-in Unsplash stock-photo search in the composer. |
 | **Client portal** | Passwordless 30-day magic-link access so clients can approve or reject posts without creating an account. |
 | **Notifications** | In-app, email, and webhook delivery with per-user preferences for every event type. |
 | **Security & ops** | Encrypted token & credential storage, Google SSO, Sentry support, and a 14-day reversible org-deletion grace period. 2FA (TOTP) is on the roadmap. |
@@ -78,6 +78,7 @@ A free hosted version is available at [brightbean.xyz/studio](https://brightbean
 | <img src="https://cdn.simpleicons.org/bluesky" width="16" height="16"> Bluesky | ✓ | ✓ | — | — |
 | <img src="https://api.iconify.design/logos/google-icon.svg" width="16" height="16"> Google Business Profile | ✓ | — | — | ✓ |
 | <img src="https://cdn.simpleicons.org/mastodon" width="16" height="16"> Mastodon | ✓ | ✓ | — | — |
+| <img src="https://cdn.simpleicons.org/devdotto/000000" width="16" height="16"> DEV.to | ✓ | — | — | — |
 
 ---
 
@@ -104,6 +105,8 @@ After deploying, set these environment variables in your platform's dashboard:
 | `ALLOWED_HOSTS` | Yes | Your app's domain, e.g. `your-app.herokuapp.com` |
 | `APP_URL` | Yes | Full public URL, e.g. `https://your-app.herokuapp.com` |
 | `STORAGE_BACKEND` | No | Set to `s3` for S3/R2 storage. Default: `local`. Heroku, Render, and Railway have ephemeral filesystems, so uploaded files are lost on redeploy without S3. |
+| `SERVE_MEDIA` | No | Only used with `STORAGE_BACKEND=local`. Default: `true`, so Django serves uploads at `/media/`. Those files are served **unauthenticated** — anyone with the path can fetch them. That is required in this mode: Instagram, Threads, Facebook, Pinterest, Google Business and dev.to fetch attachment URLs server-side when publishing, so `/media/` must be publicly reachable. Only the media library, avatars and workspace icons are exposed this way (`PUBLIC_MEDIA_PREFIXES` in `config/urls.py`); comment attachments go through a permission-checked view. Set to `false` only when a reverse proxy or CDN serves those prefixes on the same public path instead. |
+| `CADDY_MEDIA_ROOT` | No | docker-compose only. Where Caddy reads uploads from. Default: `/app/media`. Set to `/var/empty` when `STORAGE_BACKEND=s3` — the `media_data` volume survives the switch and Caddy cannot see `SERVE_MEDIA`, so it would otherwise keep serving whatever uploads were left behind. |
 | `S3_ENDPOINT_URL` | If using S3 | S3-compatible endpoint URL |
 | `S3_ACCESS_KEY_ID` | If using S3 | S3 access key |
 | `S3_SECRET_ACCESS_KEY` | If using S3 | S3 secret key |
@@ -114,6 +117,7 @@ After deploying, set these environment variables in your platform's dashboard:
 | `EMAIL_HOST_PASSWORD` | No | SMTP password |
 | `GOOGLE_AUTH_CLIENT_ID` | No | For Google OAuth login. Get from [Google Cloud Console](https://console.cloud.google.com/) → Credentials. |
 | `GOOGLE_AUTH_CLIENT_SECRET` | No | Google OAuth secret |
+| `UNSPLASH_ACCESS_KEY` | No | Enables Unsplash stock-photo search in the composer. Create a free app at [unsplash.com/developers](https://unsplash.com/developers). |
 
 For social media API keys, see [Platform Credentials](#platform-credentials). Full variable reference: `.env.example`.
 
@@ -135,9 +139,11 @@ Then start everything:
 
 ```bash
 docker compose up -d --build
-docker compose exec app python manage.py migrate
 docker compose exec app python manage.py createsuperuser
 ```
+
+Database migrations run automatically via the `migrate` Compose service before
+the `app` and `worker` services start, so there is no separate migrate step.
 
 Tailwind compiles automatically via the `tailwind` Compose service. First build
 takes ~60–90 seconds (running `npm install` in a fresh container); subsequent
@@ -284,6 +290,8 @@ docker compose exec app python manage.py createsuperuser
 
 This starts 5 containers: app (Gunicorn), worker, PostgreSQL, Caddy (auto-HTTPS), and a one-shot migrate container that runs database migrations automatically on startup. Edit the `Caddyfile` with your domain.
 
+With the default `STORAGE_BACKEND=local`, Caddy serves uploaded media directly from the `media_data` volume at `/media/`, so large images and video never occupy a Gunicorn worker thread and byte-range requests (video seeking) work. Django's own `/media/` route stays available as the fallback for deployments without this proxy.
+
 To update:
 
 ```bash
@@ -296,10 +304,16 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 | Platform | Config file | Notes |
 |----------|-------------|-------|
 | **Heroku** | `Procfile` + `app.json` | Deploy-button ready. Must use Basic+ dynos (Eco dynos break the worker). |
-| **Railway** | `railway.toml` | Three services: web, worker, managed PostgreSQL. |
+| **Railway** | `railway.toml` | The [one-click template](https://railway.com/deploy/brightbean-studio) provisions three services: web (Gunicorn, runs `migrate` on startup), worker (`python manage.py process_tasks`), and managed PostgreSQL. The web service's startup `migrate` fires the `post_migrate` hooks that register the recurring tasks, so scheduling works out of the box. |
 | **Render** | `render.yaml` | Blueprint with web, worker, PostgreSQL. Must use paid tier. |
 
 All platforms with ephemeral filesystems require `STORAGE_BACKEND=s3` - see `.env.example` for S3 configuration.
+
+**Memory sizing.** Importing the app costs roughly 100 MB before it serves a request, and a warmed Gunicorn worker settles near 200 MB - so the shipped command runs a single threaded worker (`--workers 1 --threads 4`), which fits a 512 MB dyno with room for media handling. Raise `--workers` only when you raise the memory to match; a rule of thumb is 250 MB per worker. Do **not** add `--max-requests`: gthread stops heartbeating at the start of the request that trips the counter, so the arbiter kills the worker mid-request once `--timeout` (30s) passes - which drops whichever upload happened to be that request, and uploads here can be up to 1 GB. The `worker` process needs the same headroom: it downloads videos to disk and streams them to the platform, and if it is killed mid-publish (Heroku's R15, an OOM kill, a deploy) the affected post is failed by the confirmation sweep rather than left in limbo.
+
+**Why the worker runs with `--duration 3600`.** `process_tasks` is a single non-forking process that runs every task in the same heap and never restarts, so a peak allocation raises RSS permanently - CPython and glibc keep the freed pages in their own arenas. Left alone it ratchets: on a 512 MB Basic dyno it climbed from ~280 MB after a deploy to 566 MB over 15 hours and sat at 110% of quota. `--duration` is checked at the *top* of the run loop, so a task in flight always finishes; the process then exits 0 between tasks and the platform restarts it at its floor. Nothing is lost - a recycle cannot interrupt a publish, and `confirm_pending_publishes` settles anything in flight regardless. Don't go below ~1800s, where Heroku's crash cool-off starts to engage. Other deploy targets keep the plain command: `docker-compose.yml` has no `restart:` policy on the worker, so there a clean exit would simply stop it.
+
+**`MALLOC_ARENA_MAX`.** glibc gives each thread its own arena (up to 64 MB) capped at `8 x nproc`, and containers report the host's core count, so the cap is effectively unbounded. This app has real thread churn - the publisher builds a fresh pool every 15s and boto3's managed transfer adds ten threads per download - and those arenas are never returned to the OS. On Heroku this is already set to 2 by the repo's `.profile`, which applies to web, worker, the release phase and one-off `heroku run` dynos alike; it is written as a default rather than an override, so a config var still wins if you want to tune it. Deploy targets that build from the `Dockerfile` (Render, Railway, docker-compose) do not read `.profile` - set it in their own environment config if the host is memory-tight.
 
 See `architecture.md` for detailed per-platform instructions and cost breakdowns.
 
@@ -370,15 +384,15 @@ For example, if your `APP_URL` is `https://brightbean.example.com`, the Facebook
 
 ### Meta (Facebook, Instagram, Threads)
 
-Facebook, Instagram, and Threads all use the same Meta app credentials.
+Facebook and Instagram share the same Meta app credentials. Threads runs on the same Meta app but uses a **separate app identity** — its own App ID, App Secret, and redirect URI list (steps 6-7 below).
 
 1. Go to [Meta for Developers](https://developers.facebook.com/) and create a new app (type: **Business**)
-2. Under **App Settings → Basic**, copy your **App ID** and **App Secret**
+2. Under **App Settings → Basic**, copy your **App ID** and **App Secret** — the plain ones, for Facebook and Instagram. Once the Threads use case is added this page also lists a **Threads App ID** / **Threads App Secret**; those are a different app identity and belong in the Threads variables in step 7, not here.
 3. In the App Dashboard, go to **Use cases** and add the following four use cases. For each use case, click into it and go to **Permissions and features** to add the required optional permissions:
 
    **Use case: "Manage everything on your Page"** (Facebook)
    - This use case auto-includes `business_management`, `pages_show_list`, and `public_profile`
-   - Add these optional permissions: `pages_manage_posts`, `pages_read_engagement`, `pages_read_user_content`, `pages_manage_metadata`, `read_insights`
+   - Add these optional permissions: `pages_manage_posts`, `pages_manage_engagement`, `pages_read_engagement`, `pages_read_user_content`, `pages_manage_metadata`, `read_insights`
 
    **Use case: "Messenger from Meta"** (Facebook Messaging)
    - Required to enable the `pages_messaging` permission, which is not available under the "Manage Pages" use case
@@ -395,13 +409,43 @@ Facebook, Instagram, and Threads all use the same Meta app credentials.
    ```
    {APP_URL}/social-accounts/callback/facebook/
    {APP_URL}/social-accounts/callback/instagram/
-   {APP_URL}/social-accounts/callback/threads/
    ```
-5. Set the environment variables:
+   > **Threads is separate.** Its callback does **not** belong here — the Threads use case keeps its own redirect URI list. See step 7.
+5. **Webhooks (required for the inbox).** In the App Dashboard, go to **Webhooks** (also reachable via **Use cases → Manage everything on your Page → Webhooks**) and subscribe to the **Page** object:
+   - **Callback URL:** `{APP_URL}/webhooks/facebook/`
+   - **Verify token:** the value of `FACEBOOK_WEBHOOK_VERIFY_TOKEN` from your `.env` (any random string; generate one and set the env var before clicking *Verify and save*)
+   - After verification, subscribe to the `feed`, `mention`, and `messages` fields. `feed` is what carries comments on your Page's posts.
+
+   > **This step is easy to miss and fails silently.** Connecting a Page subscribes it to your app automatically, so the account shows as healthy either way — but without the callback URL configured here, Meta never delivers anything. Comments then arrive only through the 5-minute polling fallback, and mentions not at all. Run `python manage.py diagnose_facebook --account-id <uuid>` to check.
+
+   **If you connect Instagram through this Facebook app, also subscribe to the `Instagram` object** on the same Webhooks page:
+   - **Callback URL:** `{APP_URL}/webhooks/facebook/` (the same endpoint — it handles both platforms)
+   - Subscribe to the `comments` and `mentions` fields.
+
+   > `comments` and `mentions` belong to the **Instagram** object, not the Page — a Page accepts only its own fields (`feed`, `mention`, `messages`, …). Studio subscribes the Instagram *account* automatically on connect, but the object-level configuration here can only be done in the dashboard. Without it, Instagram comments arrive only via the 5-minute poll and mentions not at all.
+6. Set the environment variables:
    ```
    PLATFORM_FACEBOOK_APP_ID=your-app-id
    PLATFORM_FACEBOOK_APP_SECRET=your-app-secret
+   # Optional: Facebook Login for Business configuration ID for agency/multi-business onboarding
+   PLATFORM_FACEBOOK_CONFIG_ID=your-configuration-id
+   FACEBOOK_WEBHOOK_VERIFY_TOKEN=your-random-verify-token
    ```
+   When `PLATFORM_FACEBOOK_CONFIG_ID` is set, Facebook and the Facebook-login
+   Instagram connector use that Login for Business configuration instead of
+   sending an ad-hoc `scope` list. Configure the required permissions and asset
+   selection in Meta's configuration, and include every business whose Pages
+   should be available to the login.
+7. **Threads:** the "Access the Threads API" use case gets its own App ID, App Secret, and redirect URIs. Go to **Use cases → Access the Threads API → Settings** and add the Threads redirect URI:
+   ```
+   {APP_URL}/social-accounts/callback/threads/
+   ```
+   Then copy the **Threads App ID** and **Threads App Secret** (also listed under **App settings → Basic**, alongside — and different from — your Facebook App ID) and set:
+   ```
+   PLATFORM_THREADS_APP_ID=your-threads-app-id
+   PLATFORM_THREADS_APP_SECRET=your-threads-app-secret
+   ```
+   These have no fallback: until both are set, Threads shows as **Not Configured** on the connect page. Sending the Facebook App ID to Threads fails with error `4476002`.
 
 ### Instagram (Direct, via Instagram Login)
 
@@ -484,7 +528,7 @@ If you set only the Path B (Company) credentials, Brightbean Studio automaticall
    ```
    {APP_URL}/social-accounts/callback/social1/
    ```
-4. Required scopes: `user.info.basic`, `user.info.profile`, `user.info.stats`, `video.publish`, `video.upload`, `video.list`
+4. Required scopes: `user.info.basic`, `video.publish`, `video.upload`, `video.list`
 5. Note: TikTok uses **Client Key** (not Client ID). Copy the **Client Key** and **Client Secret** from your app dashboard
 6. Set the environment variables:
    ```
@@ -525,7 +569,7 @@ YouTube and Google Business Profile share the same Google Cloud credentials.
    {APP_URL}/social-accounts/callback/pinterest/
    ```
 3. Copy the **App ID** and **App Secret**
-4. Required scopes: `user_accounts:read`, `boards:read`, `pins:read`, `pins:write`
+4. Required scopes: `user_accounts:read`, `boards:read`, `boards:write`, `pins:read`, `pins:write`
 5. Set the environment variables:
    ```
    PLATFORM_PINTEREST_APP_ID=your-app-id
@@ -544,6 +588,16 @@ No developer app registration needed. Users connect by entering their Bluesky ha
 
 No developer app registration needed. Brightbean Studio automatically registers an OAuth application on each Mastodon instance when a user connects their account. Users just need to enter their instance URL (e.g., `mastodon.social`).
 
+### DEV.to
+
+No developer app registration needed. Users connect by entering a personal **API key**:
+
+1. Log in to [DEV.to](https://dev.to/) and open **[Settings → Extensions](https://dev.to/settings/extensions)**
+2. Under **DEV Community API Keys**, enter a description (e.g. `Brightbean`) and click **Generate API Key**
+3. Copy the generated key and paste it when connecting your account in Brightbean Studio
+
+Posts publish as DEV.to articles (title + Markdown body). The key can be revoked at any time from the same settings page.
+
 ## Inbox: Backfill Historical Messages
 
 See the [Supported Platforms](#supported-platforms) matrix above for per-platform inbox capabilities.
@@ -556,8 +610,24 @@ python manage.py backfill_inbox --days 7
 
 Options:
 - `--days N` - Number of days to backfill (default: 7)
-- `--platform NAME` - Only backfill a specific platform (e.g., `youtube`, `linkedin`, `tiktok`)
+- `--platform NAME` - Only backfill a specific platform (e.g., `facebook`, `youtube`, `linkedin`, `tiktok`)
 - `--account-id UUID` - Only backfill a specific account
+
+For Facebook this recovers comments on the Page's posts from the last 30 days — useful after fixing a webhook that was never delivering, since comments missed while it was broken are otherwise invisible:
+
+```bash
+python manage.py backfill_inbox --platform facebook --days 30
+```
+
+## Inbox: Diagnosing a Facebook Page That Receives Nothing
+
+When a Page's comments never reach the inbox, or a post's first comment never appears, the cause is usually a permission that was not granted or a webhook that was never configured — neither of which is visible from inside the app. Ask Meta directly:
+
+```bash
+python manage.py diagnose_facebook --account-id <uuid>
+```
+
+It reports the token's granted scopes (a missing `pages_manage_engagement` is why first comments fail), which app is subscribed to the Page and to which fields (`feed` is what carries comments), and whether comments are readable at all. Add `--subscribe` to repair a missing Page subscription in place, or `--json` for output to paste into an incident.
 
 ## API & MCP for Agents
 
@@ -573,7 +643,9 @@ Issue an API key from **Organization → API Keys**. Keys are workspace-scoped, 
 Authorization: Bearer bb_studio_...
 ```
 
-Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analytics`. Each endpoint requires the relevant permission; missing permissions return `403`.
+Also send a `User-Agent` header naming your client (e.g. `User-Agent: my-agent/1.0`). Cloudflare's Browser Integrity Check, which is on by default and fronts the hosted `studio.brightbean.xyz`, rejects Python's standard-library default (`Python-urllib/3.x`) with `403` and a plain-text `error code: 1010` body before the request reaches Studio. Any value of your own gets through; `requests`, `httpx`, curl, and Node clients already send one that does.
+
+Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analytics`, `use_inbox`, `reply_from_inbox`. Each endpoint requires the relevant permission; missing permissions return `403`.
 
 ### Rate Limits
 
@@ -601,9 +673,17 @@ Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-
 | `POST` | `/media` | Upload a media file (multipart) | `upload_media` |
 | `GET` | `/media/{media_id}` | Retrieve a media asset | — |
 | `GET` | `/media` | List media assets (filter, paginate) | — |
+| `GET` | `/inbox` | List inbox messages (filter by status/type/account, paginate) | `use_inbox` |
+| `GET` | `/inbox/{message_id}` | Read one inbox message with its reply thread | `use_inbox` |
+| `POST` | `/inbox/{message_id}/replies` | Draft a reply (set `send: true` to deliver it now) | `use_inbox` (+ `reply_from_inbox` to send) |
+| `PATCH` | `/inbox/replies/{reply_id}` | Edit a draft reply | `use_inbox` |
+| `POST` | `/inbox/replies/{reply_id}/send` | Deliver a draft reply to the platform | `reply_from_inbox` |
+| `DELETE` | `/inbox/replies/{reply_id}` | Discard a draft reply | `use_inbox` |
 | `POST` | `/mcp` | JSON-RPC 2.0 endpoint for MCP clients | — |
 
-All write endpoints accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+Post creation, media uploads, and inbox reply creation accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+
+For inbox reply creation, reuse the same key and request to replay the original response without creating or sending another reply. A failed create-and-send response is replayed too; retrieve the retained failed reply from the message thread and retry delivery via `/inbox/replies/{reply_id}/send`.
 
 ### MCP Tools
 
@@ -612,16 +692,23 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | Tool | Purpose | Permission |
 |---|---|---|
 | `list_accounts` | List social accounts this API key can act on | — |
-| `create_draft` | Create a draft post (caption, title, media, first comment) | `create_posts` |
+| `create_draft` | Create a draft post (caption, title, media, first comment, optional proposed publish time) | `create_posts` |
 | `schedule_post` | Create and schedule a post in one step | `create_posts` + `publish_directly` |
 | `schedule_draft` | Schedule an existing draft | `create_posts` + `publish_directly` |
 | `get_post` | Retrieve a post with aggregate status and per-platform state | — |
+| `list_posts` | List posts newest-first, with optional status filter and cursor pagination | — |
 | `cancel_post` | Revert a scheduled post back to draft | `create_posts` |
 | `search_media` | Find media assets by query, type, tags, or folder | — |
 | `get_media` | Retrieve a single media asset by ID | — |
 | `upload_media` | Upload a small base64-encoded file (≤ 1 MB raw). For larger files, use REST `POST /media`. | `upload_media` |
 | `get_account_analytics` | Channel analytics over a rolling 7–90 day window | `view_analytics` |
 | `get_post_analytics` | Per-platform metrics for a single post (safe for polling drafts) | `view_analytics` |
+| `list_inbox_messages` | List inbox items (comments, mentions, DMs, reviews) with their reply threads | `use_inbox` |
+| `get_inbox_message` | Retrieve one inbox message and its reply thread | `use_inbox` |
+| `create_reply_draft` | Draft a reply to an inbox message (saved, not sent) | `use_inbox` |
+| `update_reply_draft` | Replace the body of a draft (or failed) reply | `use_inbox` |
+| `discard_reply_draft` | Delete a draft (or failed) reply | `use_inbox` |
+| `send_reply` | Deliver a reply (`reply_id`, or `message_id` + `body` to draft-and-send) | `reply_from_inbox` |
 
 ### Connecting an MCP client
 
@@ -671,8 +758,17 @@ Make sure the Tailwind watcher is running: `cd theme/static_src && npm run start
 **OAuth callback errors ("redirect URI mismatch")**
 The redirect URI registered on the platform must exactly match `{APP_URL}/social-accounts/callback/{platform}/`. Check that `APP_URL` in `.env` matches the URL you're accessing (including `http` vs `https` and port number).
 
+**Threads: "No app ID was provided in the request" (error `4476002`)**
+Threads uses its own App ID, not the Facebook one. Set `PLATFORM_THREADS_APP_ID` / `PLATFORM_THREADS_APP_SECRET` from **Use cases → Access the Threads API → Settings**, and register `{APP_URL}/social-accounts/callback/threads/` in that same panel — the Facebook Login redirect URI list does not cover Threads. See the [Meta](#meta-facebook-instagram-threads) section.
+
 **Background tasks not running (posts not publishing)**
 Make sure the worker is running: `python manage.py process_tasks`. In Docker: check `docker compose logs worker`.
+
+**A post is stuck on "Publishing"**
+It shouldn't stay there. `confirm_pending_publishes` runs every 60s and settles anything in that status: asynchronous publishes (TikTok accepts the upload, then transcodes) are confirmed against the platform and marked published or failed with the platform's own reason, and a post whose worker died mid-publish is failed after `PUBLISHER_STALE_PUBLISHING_TIMEOUT` so it becomes editable and retryable again. It is never re-published automatically - we can't tell "the platform never saw it" from "the platform took it and we crashed before recording that", and a duplicate video on a live account can't be undone. A third case is kept distinct on purpose: when the platform accepted the upload but we can't reach it to ask what happened, the sweep keeps reconciling for `PUBLISHER_UNCONFIRMED_TIMEOUT` (6h by default) and, if it never learns the answer, fails the post with copy that tells the user to **check the account before republishing** rather than to try again - the post may already be live. If posts sit on "Publishing" for longer than that, the worker isn't running (see above) or is being killed repeatedly - check its memory.
+
+**Uploaded images 404 in production (and Instagram/Facebook/Pinterest posts fail)**
+With `STORAGE_BACKEND=local`, `/media/` must be publicly reachable. Check that `SERVE_MEDIA` is not set to `false` unless your reverse proxy serves `MEDIA_ROOT` at that same path, and that `MEDIA_ROOT` is on a persistent volume. Those platforms fetch attachment URLs server-side, so a 404 there fails the publish, not just the thumbnail.
 
 ## Contributing
 

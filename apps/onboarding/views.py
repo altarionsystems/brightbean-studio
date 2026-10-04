@@ -21,19 +21,25 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
+from django_ratelimit.decorators import ratelimit
 
+from apps.common.mail import transactional
 from apps.credentials.models import PlatformCredential
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
 from apps.notifications.engine import notify
 from apps.notifications.models import EventType
 from apps.social_accounts.oauth_aliases import from_url_slug, redirect_uri_from_request, to_url_slug
+from apps.social_accounts.oauth_pkce import issue_pkce_verifier, pkce_kwargs
+from apps.social_accounts.provider_factory import _get_provider_for_platform
 from apps.social_accounts.views import (
     _create_or_update_account,
     _get_configured_platforms,
-    _get_provider_for_platform,
     _normalize_mastodon_instance_url,
     _resolve_mastodon_extra_creds,
+    page_is_publishable,
+    promote_meta_user_token,
+    resolve_page_account_token,
 )
 
 from .models import ConnectionLink, ConnectionLinkUsage, OnboardingChecklist
@@ -153,6 +159,7 @@ def revoke_link(request, workspace_id, link_id):
 @login_required
 @require_permission("manage_social_accounts")
 @require_POST
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
 def send_link_email(request, workspace_id, link_id):
     """Send the connection link to a client email."""
     link = get_object_or_404(ConnectionLink.objects.for_workspace(workspace_id), id=link_id)
@@ -184,9 +191,19 @@ def send_link_email(request, workspace_id, link_id):
         body=text_content,
         from_email=getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@localhost"),
         to=[email],
+        headers=transactional(),
     )
     msg.attach_alternative(html_content, "text/html")
-    msg.send(fail_silently=False)
+    # send() returns the number accepted, and the outbound budget drops a
+    # message by returning 0 rather than raising. Telling someone the link was
+    # sent when it was not is how they end up waiting for an email that is never
+    # coming.
+    if not msg.send(fail_silently=False):
+        messages.error(
+            request,
+            "We could not send that link right now. Please try again shortly.",
+        )
+        return redirect("social_accounts:list", workspace_id=workspace_id)
 
     messages.success(request, f"Connection link sent to {email}.")
     return redirect("social_accounts:list", workspace_id=workspace_id)
@@ -311,6 +328,7 @@ def connection_oauth_start(request, token):
     provider = _get_provider_for_platform(platform, org.id)
     nonce = secrets.token_urlsafe(32)
     state = _sign_connection_link_state(link.workspace_id, platform, token, nonce)
+    code_verifier = issue_pkce_verifier(provider)
 
     # Store in session
     request.session[CONNECTION_LINK_OAUTH_SESSION_KEY] = {
@@ -318,10 +336,11 @@ def connection_oauth_start(request, token):
         "workspace_id": str(link.workspace_id),
         "platform": platform,
         "token": token,
+        "code_verifier": code_verifier,
     }
 
     redirect_uri = _build_connection_redirect_uri(request, platform)
-    auth_url = provider.get_auth_url(redirect_uri, state)
+    auth_url = provider.get_auth_url(redirect_uri, state, **pkce_kwargs(code_verifier))
     return redirect(auth_url)
 
 
@@ -409,19 +428,50 @@ def connection_oauth_callback(request, platform):
 
         provider = _get_provider_for_platform(platform, org.id, **extra_creds)
         redirect_uri = redirect_uri_from_request(request)
-        tokens = provider.exchange_code(code, redirect_uri)
-        profile = provider.get_profile(tokens.access_token)
+        tokens = provider.exchange_code(code, redirect_uri, **pkce_kwargs(session_data.get("code_verifier")))
 
-        # Handle Facebook/Instagram multi-page: auto-connect first page
+        # Handle Facebook/Instagram multi-page: derive every Page token from a
+        # long-lived user token and connect all publishable accounts exposed by
+        # the login. Connection links are the bulk/agency onboarding path.
         if platform in (
             PlatformCredential.Platform.FACEBOOK,
             PlatformCredential.Platform.INSTAGRAM,
         ) and hasattr(provider, "get_user_pages"):
+            tokens, promoted = promote_meta_user_token(provider, platform, tokens)
             pages = provider.get_user_pages(tokens.access_token)
             if pages:
                 from providers.types import AccountProfile
 
+                skipped: list[str] = []
+
                 for page in pages:
+                    name = page.get("name") or page["id"]
+                    if not page_is_publishable(page):
+                        # Meta reported this Page's task list and it lacks
+                        # CREATE_CONTENT. Connecting it would hand the client an
+                        # account that fails every publish.
+                        skipped.append(f"{name} (your Facebook access cannot create content for it)")
+                        logger.warning(
+                            "Connection link %s: %s grants no CREATE_CONTENT for %s; skipping.",
+                            link.id,
+                            platform,
+                            name,
+                        )
+                        continue
+
+                    access_token = resolve_page_account_token(page, platform, tokens.access_token)
+                    if not access_token:
+                        # Silently dropping these would leave the client on a
+                        # success page for accounts that were never connected.
+                        skipped.append(f"{name} (the platform provided no account token)")
+                        logger.warning(
+                            "Connection link %s: %s provided no account token for %s; skipping.",
+                            link.id,
+                            platform,
+                            name,
+                        )
+                        continue
+
                     page_profile = AccountProfile(
                         platform_id=page["id"],
                         name=page["name"],
@@ -433,17 +483,42 @@ def connection_oauth_callback(request, platform):
                         workspace_id=workspace_id,
                         platform=platform,
                         profile=page_profile,
-                        access_token=page.get("access_token", tokens.access_token),
-                        refresh_token=tokens.refresh_token,
-                        expires_in=tokens.expires_in,
+                        access_token=access_token,
+                        # The Page token IS the credential. Storing the user
+                        # token alongside it as a generic refresh token would
+                        # later have the refresh path overwrite a Page token
+                        # with a user token — the wrong identity entirely.
+                        refresh_token=None,
+                        # A Page token derived from a long-lived user token does
+                        # not expire, so no expiry is the truthful record. But
+                        # when the promotion fell back we are holding the
+                        # short-lived token, and a Page token minted from it
+                        # dies with it — store that expiry or the health and
+                        # publish checks skip the account until it just fails.
+                        expires_in=None if promoted else tokens.expires_in,
+                        # Instagram-via-Facebook receives its webhooks through
+                        # the linked Page, so remember which Page to subscribe.
+                        webhook_target_id=page.get("page_id", ""),
                     )
                     ConnectionLinkUsage.objects.get_or_create(
                         connection_link=link,
                         social_account=account,
                     )
+
+                if skipped:
+                    names = "; ".join(skipped)
+                    request.session["connection_link_error"] = (
+                        f"Could not connect {names}. Check that you granted access to those "
+                        "accounts with a role that can create content, then try again."
+                    )
                 return redirect("onboarding:connection_page", token=token)
+            request.session["connection_link_error"] = (
+                "No Facebook Pages or linked Instagram professional accounts were found for this login."
+            )
+            return redirect("onboarding:connection_page", token=token)
 
         # Standard single-account flow
+        profile = provider.get_profile(tokens.access_token)
         account = _create_or_update_account(
             workspace_id=workspace_id,
             platform=platform,

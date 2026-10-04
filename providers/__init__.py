@@ -6,19 +6,23 @@ Use get_provider() to instantiate a provider with app credentials.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 from .bluesky import BlueskyProvider
+from .devto import DevtoProvider
 from .facebook import FacebookProvider
 from .google_business import GoogleBusinessProvider
 from .instagram import InstagramProvider
 from .instagram_login import InstagramLoginProvider
+from .linkedin import LINKEDIN_RESERVED_CHARS
 from .linkedin_company import LinkedInCompanyProvider
 from .linkedin_personal import LinkedInPersonalProvider
 from .mastodon import MastodonProvider
 from .pinterest import PinterestProvider
 from .threads import ThreadsProvider
 from .tiktok import TikTokProvider
+from .types import PostType
 from .youtube import YouTubeProvider
 
 if TYPE_CHECKING:
@@ -37,7 +41,67 @@ PROVIDER_REGISTRY: dict[str, type[SocialProvider]] = {
     "bluesky": BlueskyProvider,
     "google_business": GoogleBusinessProvider,
     "mastodon": MastodonProvider,
+    "devto": DevtoProvider,
 }
+
+# Characters a platform escapes in the caption it publishes. Each one costs two
+# characters on the wire, so a limit has to be counted against the escaped text
+# rather than the text the user typed.
+CAPTION_ESCAPED_CHARS: dict[str, str] = {
+    # LinkedIn's little-text commentary; the backslash escapes itself too.
+    "linkedin_personal": "\\" + LINKEDIN_RESERVED_CHARS,
+    "linkedin_company": "\\" + LINKEDIN_RESERVED_CHARS,
+}
+
+
+def caption_wire_length(platform: str, text: str) -> int:
+    """Length of ``text`` as ``platform`` counts it, after any escaping.
+
+    The composer's counter and the published payload have to agree: a LinkedIn
+    caption of 2,990 characters holding 20 parentheses arrives as 3,010 and is
+    rejected, even though the user was shown a green counter.
+    ``providers.linkedin.escape_commentary`` is the transform this mirrors;
+    ``tests/providers/test_caption_wire_length.py`` holds the two together.
+    """
+    escaped = CAPTION_ESCAPED_CHARS.get(platform)
+    if not escaped:
+        return len(text)
+    return len(text) + sum(text.count(ch) for ch in escaped)
+
+
+VIDEO_POST_TYPES = frozenset({PostType.VIDEO, PostType.SHORT})
+
+
+@functools.cache
+def is_video_only(platform: str) -> bool:
+    """Whether ``platform`` can publish nothing but video.
+
+    The publisher drops every non-video attachment for these platforms (the
+    same ``VIDEO_POST_TYPES`` test in ``PublishEngine._dispatch_to_provider``),
+    so a post without a video reaches them with nothing to upload and can only
+    fail. Cached because ``supported_post_types`` is fixed per provider class,
+    and this is asked for every account an API response or scheduling check
+    touches.
+    """
+    provider_cls = PROVIDER_REGISTRY.get(platform)
+    if provider_cls is None:
+        return False
+    return set(provider_cls().supported_post_types) <= VIDEO_POST_TYPES
+
+
+@functools.cache
+def requires_media(platform: str) -> bool:
+    """Whether ``platform`` can't publish text on its own.
+
+    True wherever the provider supports no ``TEXT`` post: Instagram and
+    Pinterest refuse a post with nothing attached, and the video-only
+    platforms are a stricter case of the same. Derived from the provider, like
+    ``is_video_only``, so a new platform is covered without a list to update.
+    """
+    provider_cls = PROVIDER_REGISTRY.get(platform)
+    if provider_cls is None:
+        return False
+    return PostType.TEXT not in provider_cls().supported_post_types
 
 
 def get_provider(platform: str, credentials: dict | None = None) -> SocialProvider:

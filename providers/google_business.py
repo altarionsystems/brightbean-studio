@@ -41,6 +41,11 @@ class GoogleBusinessProvider(SocialProvider):
     - ``location_id`` – Google Business location ID
     """
 
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
@@ -73,7 +78,7 @@ class GoogleBusinessProvider(SocialProvider):
     # OAuth
     # ------------------------------------------------------------------
 
-    def get_auth_url(self, redirect_uri: str, state: str) -> str:
+    def get_auth_url(self, redirect_uri: str, state: str, code_verifier: str | None = None) -> str:
         """Build the Google OAuth 2.0 authorization URL."""
         params = {
             "client_id": self.credentials["client_id"],
@@ -86,7 +91,7 @@ class GoogleBusinessProvider(SocialProvider):
         }
         return f"{AUTH_URL}?{urlencode(params)}"
 
-    def exchange_code(self, code: str, redirect_uri: str) -> OAuthTokens:
+    def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
         """Exchange an authorization code for Google access/refresh tokens."""
         resp = self._request(
             "POST",
@@ -244,6 +249,7 @@ class GoogleBusinessProvider(SocialProvider):
             raise PublishError(
                 f"Post text exceeds {self.max_caption_length} characters (got {len(content.text)})",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         account_id = self._get_account_id(access_token)

@@ -4,12 +4,14 @@ Covers V1 from the May-2026 security audit: an org admin must not be able to
 invite users with org/workspace roles above their own, nor demote an org owner.
 """
 
+from django.template.loader import render_to_string
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.members.models import Invitation, OrgMembership, WorkspaceMembership
+from apps.members.views import _org_role_choices_for
 from apps.organizations.models import Organization
 from apps.workspaces.models import Workspace
 
@@ -127,6 +129,88 @@ class InviteRoleHierarchyTests(TestCase):
         )
         self.assertLess(response.status_code, 400)
         self.assertTrue(Invitation.objects.filter(email="editor@example.com").exists())
+
+
+class OrgRoleChoiceGatingTests(TestCase):
+    """GET /members/ — the Admin org-role option is offered only to owners.
+
+    Non-owners can never grant Admin (services.create_invitation enforces it),
+    so the UI must not present the choice in the first place. Guards against the
+    option silently reappearing in the invite form or role dropdown.
+    """
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Test Org")
+        self.owner = _make_user("owner@example.com")
+        self.admin = _make_user("admin@example.com")
+        OrgMembership.objects.create(user=self.owner, organization=self.org, org_role="owner")
+        OrgMembership.objects.create(user=self.admin, organization=self.org, org_role="admin")
+        self.url = reverse("members:list")
+
+    def test_admin_is_not_offered_the_admin_role(self):
+        _login(self.client, self.admin)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        # `value="admin"` renders only for an org-role control (invite radio /
+        # role <option>); workspace roles have no "admin". Its absence proves
+        # the option is gated for this non-owner viewer.
+        self.assertNotContains(response, 'value="admin"')
+        self.assertContains(response, 'value="member"')
+
+    def test_owner_is_offered_the_admin_role(self):
+        _login(self.client, self.owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'value="admin"')
+        self.assertContains(response, 'value="member"')
+
+
+class ManageWorkspaceModalTargetTests(TestCase):
+    """GET /members/ renders one HTMX modal target per manageable member."""
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Test Org")
+        self.owner = _make_user("owner@example.com")
+        self.member_a = _make_user("member-a@example.com")
+        self.member_b = _make_user("member-b@example.com")
+        OrgMembership.objects.create(user=self.owner, organization=self.org, org_role="owner")
+        self.member_a_membership = OrgMembership.objects.create(
+            user=self.member_a,
+            organization=self.org,
+            org_role="member",
+        )
+        self.member_b_membership = OrgMembership.objects.create(
+            user=self.member_b,
+            organization=self.org,
+            org_role="member",
+        )
+        self.url = reverse("members:list")
+
+    def test_manage_workspace_targets_are_unique_per_member(self):
+        owner_membership = OrgMembership.objects.get(user=self.owner, organization=self.org)
+        html = "".join(
+            render_to_string(
+                "members/partials/member_row.html",
+                {
+                    "member": {
+                        "membership": membership,
+                        "user": membership.user,
+                        "workspace_memberships": [],
+                    },
+                    "is_admin": True,
+                    "current_user": self.owner,
+                    "workspace_role_choices": WorkspaceMembership.WorkspaceRole.choices,
+                    "org_role_choices": _org_role_choices_for(owner_membership),
+                },
+            )
+            for membership in (self.member_a_membership, self.member_b_membership)
+        )
+
+        self.assertNotIn('id="ws-modal-content"', html)
+        for membership in (self.member_a_membership, self.member_b_membership):
+            target_id = f"ws-modal-content-{membership.id}"
+            self.assertIn(f'hx-target="#{target_id}"', html)
+            self.assertIn(f'id="{target_id}"', html)
 
 
 class UpdateMemberRoleHierarchyTests(TestCase):

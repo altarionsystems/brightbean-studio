@@ -258,6 +258,12 @@ class Post(models.Model):
     scheduled_at = models.DateTimeField(blank=True, null=True, db_index=True)
     published_at = models.DateTimeField(blank=True, null=True)
 
+    # Optional draft-stage suggestion of when to publish — distinct from the
+    # committed ``scheduled_at``. Lets a planner/agent record "this should go
+    # out Tue 9am" without queuing it for the publisher. Cleared once the post
+    # is actually scheduled.
+    proposed_publish_at = models.DateTimeField(blank=True, null=True)
+
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -341,6 +347,21 @@ class PlatformPost(models.Model):
         PUBLISHING = "publishing", "Publishing"
         PUBLISHED = "published", "Published"
         FAILED = "failed", "Failed"
+        ON_HOLD = "on_hold", "On Hold"
+
+    # Every field :meth:`transition_to` may write. A caller that passes
+    # ``update_fields`` MUST include these or the transition half-applies
+    # silently — which is exactly how the retry-budget and publish-handle
+    # resets went missing on three of the five scheduling paths. Spell the
+    # set once here rather than re-listing it at each call site.
+    TRANSITION_FIELDS = (
+        "status",
+        "published_at",
+        "platform_post_id",
+        "retry_count",
+        "next_retry_at",
+        "publish_error",
+    )
 
     # Statuses that must never be removed by *accidental* deletion paths
     # (composer account deselection, autosave sync): a published or
@@ -349,6 +370,21 @@ class PlatformPost(models.Model):
     # user's call and intentionally bypasses this.
     PROTECTED_STATUSES = (Status.PUBLISHED, Status.PUBLISHING)
 
+    # Statuses whose scheduled time may be changed by a calendar drag-and-drop.
+    # A dropped draft/failed chip becomes ``scheduled`` (an implicit
+    # (re)schedule / retry); the others just move in time, keeping their status.
+    # ``published`` and ``publishing`` are excluded — the post is done or in
+    # flight and must not be dragged. Shared by the calendar chip templates and
+    # the reschedule endpoint so both agree on what's draggable.
+    RESCHEDULABLE_STATUSES = (
+        Status.DRAFT,
+        Status.APPROVED,
+        Status.SCHEDULED,
+        Status.FAILED,
+        Status.PENDING_REVIEW,
+        Status.PENDING_CLIENT,
+    )
+
     # Valid state transitions (from → set of allowed targets). Mirrors the old
     # Post-level state machine minus ``partially_published`` — that concept
     # only applies at the aggregate/Post level and is produced by
@@ -356,15 +392,26 @@ class PlatformPost(models.Model):
     VALID_TRANSITIONS = {
         "draft": {"pending_review", "scheduled", "publishing"},
         "pending_review": {"approved", "changes_requested", "rejected"},
-        "approved": {"pending_client", "scheduled", "publishing", "draft"},
+        "approved": {"pending_client", "scheduled", "publishing", "draft", "on_hold", "pending_review"},
         "pending_client": {"approved", "changes_requested", "rejected"},
         "changes_requested": {"pending_review", "draft"},
         "rejected": {"draft", "pending_review"},
         "scheduled": {"publishing", "draft"},
         "publishing": {"published", "failed", "scheduled"},  # scheduled = retry
         "failed": {"publishing", "draft", "scheduled"},
+        # Client-requested hold: parked out of the publish path. The team resolves
+        # it back to approved (resume), draft (rework), or changes_requested. There
+        # is deliberately no on_hold → scheduled edge — un-hold to ``approved`` first
+        # so nothing publishes straight out of a hold.
+        "on_hold": {"approved", "draft", "changes_requested"},
         "published": set(),  # terminal
     }
+
+    class FirstCommentStatus(models.TextChoices):
+        NONE = "none", "Not requested"
+        PENDING = "pending", "Pending"
+        POSTED = "posted", "Posted"
+        FAILED = "failed", "Failed"
 
     STATUS_COLORS = {
         "draft": "gray",
@@ -378,6 +425,7 @@ class PlatformPost(models.Model):
         "published": "green",
         "partially_published": "yellow",  # only used by Post-level aggregate
         "failed": "red",
+        "on_hold": "violet",
     }
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -422,6 +470,23 @@ class PlatformPost(models.Model):
     )
     publish_error = models.TextField(blank=True, default="")
     published_at = models.DateTimeField(blank=True, null=True)
+
+    # First-comment outcome. Kept in dedicated columns rather than in
+    # ``platform_extra``: that field is an *input* channel — the publish engine
+    # merges it into ``PublishContent.extra``, which providers forward into
+    # their API payloads — so status written there would ride along on the next
+    # publish. A post whose comment failed must also be distinguishable from a
+    # fully successful one, which needs a queryable column.
+    first_comment_status = models.CharField(
+        max_length=10,
+        choices=FirstCommentStatus.choices,
+        default=FirstCommentStatus.NONE,
+        db_index=True,
+    )
+    first_comment_id = models.CharField(max_length=255, blank=True, default="")
+    first_comment_error = models.TextField(blank=True, default="")
+    first_comment_retry_count = models.PositiveIntegerField(default=0)
+    first_comment_posted_at = models.DateTimeField(blank=True, null=True)
     scheduled_at = models.DateTimeField(
         blank=True,
         null=True,
@@ -430,6 +495,26 @@ class PlatformPost(models.Model):
     )
     retry_count = models.PositiveIntegerField(default=0)
     next_retry_at = models.DateTimeField(blank=True, null=True)
+
+    # Analytics sync state — the read-side counterpart to the retry budget
+    # above, owned solely by ``apps.analytics.tasks``.
+    #
+    # ``analytics_attempted_at`` is the last time the sync *tried* this post's
+    # per-post metrics fetch, successful or not. The cadence ladder used to be
+    # derived from the newest ``PostInsightsSnapshot.captured_at`` instead,
+    # which meant a post whose fetch kept failing wrote no row, looked
+    # never-synced, and was retried on every hourly tick forever. That is the
+    # amplification that emptied a whole day of YouTube API quota in an hour.
+    #
+    # NULL means "never attempted under this scheme"; the sync falls back to the
+    # old snapshot signal for those, so no backfill is needed.
+    analytics_attempted_at = models.DateTimeField(blank=True, null=True)
+
+    # Consecutive failed attempts, reset to 0 by any success. Drives the
+    # exponential backoff in ``apps.analytics.tasks._analytics_failure_backoff``
+    # so a permanently unfetchable post (deleted video, revoked visibility)
+    # costs one call a week rather than one an hour.
+    analytics_failure_count = models.PositiveSmallIntegerField(default=0, db_default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -446,6 +531,20 @@ class PlatformPost(models.Model):
 
     def __str__(self):
         return f"PlatformPost({self.social_account.platform}): {self.status}"
+
+    @property
+    def is_reschedulable(self):
+        """Whether this chip may be dragged to a new date on the calendar."""
+        return self.status in self.RESCHEDULABLE_STATUSES
+
+    @property
+    def is_bulk_selectable(self):
+        """Whether this row can be the target of a bulk draft/publish/delete.
+
+        Every branch of ``bulk_platform_action`` skips ``PROTECTED_STATUSES``, so
+        offering a checkbox on those rows would only ever be a no-op.
+        """
+        return self.status not in self.PROTECTED_STATUSES
 
     # ------------------------------------------------------------------
     # State machine
@@ -466,6 +565,22 @@ class PlatformPost(models.Model):
         self.status = new_status
         if new_status == "published":
             self.published_at = timezone.now()
+        if new_status == "scheduled":
+            # A deliberate re-schedule is a fresh start, so the old attempt's
+            # backoff must not carry over: a spent retry_count would otherwise
+            # fail the post on its first attempt instead of giving it the full
+            # budget, and a stale next_retry_at would hold it back from the due
+            # query. Safe to do here because the publish engine's own
+            # retry path sets ``status`` directly and never comes through this
+            # method — so this cannot clear a backoff it just scheduled.
+            self.retry_count = 0
+            self.next_retry_at = None
+            self.publish_error = ""
+            # The handle belongs to the *previous* attempt. Left in place, the
+            # confirmation sweep would treat it as this attempt's and settle the
+            # post against an outcome that has nothing to do with it — reporting
+            # a publish that never reached the platform as done.
+            self.platform_post_id = ""
 
     @property
     def status_color(self):
@@ -516,7 +631,9 @@ class PlatformPost(models.Model):
 
     @property
     def caption_length(self):
-        return len(self.effective_caption)
+        # Not len(): platforms that escape reserved characters send more than
+        # was typed, and the limit applies to what is sent.
+        return self.social_account.caption_wire_length(self.effective_caption)
 
     @property
     def is_over_limit(self):

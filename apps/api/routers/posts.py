@@ -42,8 +42,10 @@ from apps.api.schemas import (
 from apps.composer.models import Post
 from apps.composer.services import (
     create_post,
+    media_change_blocker,
     sync_post_scheduled_at,
     transition_platform_post,
+    usable_media_types,
 )
 from apps.social_accounts.models import SocialAccount
 
@@ -81,8 +83,23 @@ def _resolve_account(request: HttpRequest, social_account_id: uuid.UUID) -> Soci
     return SocialAccount.objects.get(id=social_account_id)
 
 
-def _post_to_response(post: Post) -> PostResponse:
-    return PostResponse.from_post(post)
+def _can_view_internal_notes(request: HttpRequest) -> bool:
+    """Whether this caller may see a post's team-only ``internal_notes``.
+
+    The composer hides ``internal_notes`` from the ``client`` / ``viewer``
+    workspace roles ([views.py](apps/composer/views.py): ``can_view_internal_notes``).
+    Those are exactly the builtin roles without ``create_posts`` (see
+    ``BUILTIN_ROLE_PERMISSIONS``), so gating visibility on ``create_posts``
+    reproduces that rule uniformly for both API keys and OAuth members. Reads
+    (`GET /posts/{id}`) aren't otherwise permission-gated, so without this the
+    shared serializer would leak notes to any read-capable client/viewer.
+    """
+    membership = getattr(request, "workspace_membership", None)
+    return bool(membership and membership.effective_permissions.get("create_posts", False))
+
+
+def _post_to_response(request: HttpRequest, post: Post) -> PostResponse:
+    return PostResponse.from_post(post, include_internal_notes=_can_view_internal_notes(request))
 
 
 def _get_workspace_post(request: HttpRequest, post_id: uuid.UUID) -> Post:
@@ -231,12 +248,16 @@ def create(request, payload: CreatePostRequest):
             media_asset_ids=payload.media_asset_ids,
             title=payload.title,
             first_comment=payload.first_comment,
+            internal_notes=payload.internal_notes,
             scheduled_at=payload.scheduled_at,
+            # A scheduled post carries a real time, not a proposal — ignore any
+            # proposed_publish_at when scheduling so the two never coexist.
+            proposed_publish_at=None if payload.action == "schedule" else payload.proposed_publish_at,
             author=request.user if not request.user.is_anonymous else None,
             status="scheduled" if payload.action == "schedule" else "draft",
             platform_overrides=platform_overrides,
         )
-        body = _post_to_response(post)
+        body = _post_to_response(request, post)
         status_code = 201
         log_audit_entry(
             request,
@@ -272,7 +293,7 @@ def retrieve(request, post_id: uuid.UUID):
     enforce_http_rate_limits(request, is_write=False)
     post = _get_workspace_post(request, post_id)
     log_audit_entry(request, action="post.read", target_id=post.id, status_code=200)
-    return _post_to_response(post)
+    return _post_to_response(request, post)
 
 
 @router.patch("/{post_id}", response=PostResponse, summary="Update draft fields")
@@ -322,6 +343,15 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
         missing = [i for i in wanted_media if i not in resolved_assets]
         if missing:
             raise HttpError(422, f"Media asset(s) not in workspace: {missing}")
+        # A scheduled post may be edited, but not into one it can't publish:
+        # swapping a TikTok post's video for an image, or emptying a pin's
+        # media, would leave it queued to fail after the schedule route had
+        # checked it.
+        reason = media_change_blocker(
+            post, media_types_after=usable_media_types(resolved_assets[mid] for mid in wanted_media)
+        )
+        if reason:
+            raise HttpError(422, reason)
 
     with transaction.atomic():
         update_fields: list[str] = []
@@ -334,6 +364,9 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
         if payload.first_comment is not None:
             post.first_comment = payload.first_comment
             update_fields.append("first_comment")
+        if payload.internal_notes is not None:
+            post.internal_notes = payload.internal_notes
+            update_fields.append("internal_notes")
         if payload.scheduled_at is not None:
             # Re-time any currently-scheduled child. Drafts are unaffected.
             # ``QuerySet.update()`` bypasses ``auto_now``, so we include
@@ -346,6 +379,12 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
             scheduled_children.update(scheduled_at=payload.scheduled_at, updated_at=_tz.now())
             post.scheduled_at = payload.scheduled_at
             update_fields.append("scheduled_at")
+        if payload.proposed_publish_at is not None:
+            # Draft-stage suggestion; null is a no-op, consistent with the
+            # other PATCH fields. Not gated on publish_directly — it never
+            # reaches the publisher.
+            post.proposed_publish_at = payload.proposed_publish_at
+            update_fields.append("proposed_publish_at")
         if payload.media_asset_ids is not None:
             # Replace the attachment set in order. Validated above, so
             # the only remaining failure modes are DB-level — the atomic
@@ -366,7 +405,7 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
 
     post.refresh_from_db()
     log_audit_entry(request, action="post.update", target_id=post.id, status_code=200)
-    return _post_to_response(post)
+    return _post_to_response(request, post)
 
 
 @router.post("/{post_id}/schedule", response=PostResponse, summary="Schedule a draft")
@@ -409,7 +448,7 @@ def schedule(request, post_id: uuid.UUID, payload: ScheduleRequest):
 
     post.refresh_from_db()
     log_audit_entry(request, action="post.schedule", target_id=post.id, status_code=200)
-    return _post_to_response(post)
+    return _post_to_response(request, post)
 
 
 @router.post("/{post_id}/cancel", response=PostResponse, summary="Cancel a scheduled post (back to draft)")
@@ -438,4 +477,4 @@ def cancel(request, post_id: uuid.UUID):
 
     post.refresh_from_db()
     log_audit_entry(request, action="post.cancel", target_id=post.id, status_code=200)
-    return _post_to_response(post)
+    return _post_to_response(request, post)

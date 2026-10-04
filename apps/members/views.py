@@ -5,12 +5,30 @@ from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
+from django_ratelimit.decorators import ratelimit
 
 from apps.workspaces.models import Workspace
 
 from . import services
 from .decorators import require_org_role
 from .models import Invitation, OrgMembership, WorkspaceMembership
+
+
+def _org_role_choices_for(membership):
+    """Org-role options the *viewer* is allowed to assign.
+
+    Only owners can grant the Admin role (mirrors the owner-only guard in
+    ``services.create_invitation`` / ``services.update_member_org_role``), so
+    non-owners only ever see Member — they never get offered a role the
+    backend would reject. The backend checks remain as the defense-in-depth
+    backstop; this is UX only.
+    """
+    choices = []
+    if membership.org_role == OrgMembership.OrgRole.OWNER:
+        choices.append((OrgMembership.OrgRole.ADMIN, "Admin"))
+    choices.append((OrgMembership.OrgRole.MEMBER, "Member"))
+    return choices
+
 
 # ---------------------------------------------------------------------------
 # Team Members List
@@ -67,11 +85,8 @@ def member_list(request):
             .order_by("-created_at")
         )
 
-    # Role choices for forms (exclude owner)
-    org_role_choices = [
-        (OrgMembership.OrgRole.ADMIN, "Admin"),
-        (OrgMembership.OrgRole.MEMBER, "Member"),
-    ]
+    # Role choices for forms: only owners may assign Admin (see helper).
+    org_role_choices = _org_role_choices_for(request.org_membership)
     workspace_role_choices = WorkspaceMembership.WorkspaceRole.choices
 
     return render(
@@ -98,6 +113,7 @@ def member_list(request):
 @login_required
 @require_org_role("admin")
 @require_POST
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
 def invite_member(request):
     """Create and send a team member invitation."""
     org = request.org
@@ -153,6 +169,7 @@ def invite_member(request):
 @login_required
 @require_org_role("admin")
 @require_POST
+@ratelimit(key="user", rate="10/m", method="POST", block=True)
 def resend_invite(request, invitation_id):
     """Resend an invitation email with a fresh token."""
     invitation = get_object_or_404(Invitation, id=invitation_id, organization=request.org)
@@ -292,6 +309,7 @@ def update_member_role(request, membership_id):
                 "is_admin": True,
                 "current_user": request.user,
                 "workspace_role_choices": WorkspaceMembership.WorkspaceRole.choices,
+                "org_role_choices": _org_role_choices_for(request.org_membership),
             },
         )
     return redirect("members:list")
@@ -374,6 +392,7 @@ def manage_workspaces(request, membership_id):
                     "is_admin": True,
                     "current_user": request.user,
                     "workspace_role_choices": WorkspaceMembership.WorkspaceRole.choices,
+                    "org_role_choices": _org_role_choices_for(request.org_membership),
                 },
             )
         return redirect("members:list")

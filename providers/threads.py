@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from urllib.parse import urlencode
 
 from .base import SocialProvider
@@ -26,9 +27,24 @@ AUTH_URL = "https://www.threads.com/oauth/authorize"
 TOKEN_URL = "https://graph.threads.net/oauth/access_token"
 API_BASE = "https://graph.threads.net/v1.0"
 
+# Threads ingests media (esp. video) asynchronously: the container must reach
+# status FINISHED before it can be published, otherwise threads_publish fails
+# with "The requested resource does not exist" (code 24 / media not found).
+CONTAINER_POLL_INTERVAL = 3  # seconds
+CONTAINER_POLL_MAX_ATTEMPTS = 40  # up to ~2 min for video processing
+
+# Meta issues long-lived Threads tokens with a 60-day TTL. Used as the fallback
+# when a token response omits ``expires_in`` — see ``_tokens_from``.
+LONG_LIVED_TOKEN_TTL = 60 * 24 * 60 * 60
+
 
 class ThreadsProvider(SocialProvider):
     """Threads API provider using OAuth 2.0."""
+
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -84,7 +100,7 @@ class ThreadsProvider(SocialProvider):
     # OAuth
     # ------------------------------------------------------------------
 
-    def get_auth_url(self, redirect_uri: str, state: str) -> str:
+    def get_auth_url(self, redirect_uri: str, state: str, code_verifier: str | None = None) -> str:
         params = {
             "client_id": self.credentials["client_id"],
             "redirect_uri": redirect_uri,
@@ -94,7 +110,7 @@ class ThreadsProvider(SocialProvider):
         }
         return f"{AUTH_URL}?{urlencode(params)}"
 
-    def exchange_code(self, code: str, redirect_uri: str) -> OAuthTokens:
+    def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
         resp = self._request(
             "POST",
             TOKEN_URL,
@@ -137,9 +153,28 @@ class ThreadsProvider(SocialProvider):
                 platform=self.platform_name,
                 raw_response=body,
             )
+        return self._tokens_from(body)
+
+    @staticmethod
+    def _tokens_from(body: dict) -> OAuthTokens:
+        """Build OAuthTokens from a long-lived-token response.
+
+        Threads issues no separate refresh token: the long-lived access token is
+        replayed as its own refresh credential (see ``refresh_token``). Returning
+        it in ``refresh_token`` is what lets the refresh machinery — which skips
+        accounts whose ``oauth_refresh_token`` is empty — ever run, and carries
+        the rotated token forward so an account keeps refreshing rather than
+        replaying the stale original.
+
+        ``expires_in`` falls back to the documented 60-day TTL: consumers only
+        advance ``token_expires_at`` when it is truthy, so a response without it
+        would leave a stale past expiry in place and re-trigger a refresh on
+        every health check.
+        """
         return OAuthTokens(
             access_token=body["access_token"],
-            expires_in=body.get("expires_in"),
+            refresh_token=body["access_token"],
+            expires_in=body.get("expires_in") or LONG_LIVED_TOKEN_TTL,
             token_type=body.get("token_type", "Bearer"),
             raw_response=body,
         )
@@ -166,12 +201,7 @@ class ThreadsProvider(SocialProvider):
                 platform=self.platform_name,
                 raw_response=body,
             )
-        return OAuthTokens(
-            access_token=body["access_token"],
-            expires_in=body.get("expires_in"),
-            token_type=body.get("token_type", "Bearer"),
-            raw_response=body,
-        )
+        return self._tokens_from(body)
 
     # ------------------------------------------------------------------
     # Profile
@@ -254,10 +284,20 @@ class ThreadsProvider(SocialProvider):
 
         if not creation_id:
             raise PublishError(
-                f"Threads container creation failed: {create_body}",
+                # The body goes in raw_response, not the message: publish_error
+                # is rendered to users, and a ProviderError message is the one
+                # thing the sanitizer passes through verbatim.
+                "Threads container creation failed",
                 platform=self.platform_name,
                 raw_response=create_body,
             )
+
+        # Step 1b: wait for media containers to finish processing before
+        # publishing. Text-only threads publish instantly, but image/video
+        # containers are ingested asynchronously; publishing too early fails
+        # with "media not found".
+        if container_payload["media_type"] != "TEXT":
+            self._wait_for_container(access_token, creation_id)
 
         # Step 2: Publish the container
         publish_resp = self._request(
@@ -273,6 +313,40 @@ class ThreadsProvider(SocialProvider):
             extra=publish_body,
         )
 
+    def _wait_for_container(self, access_token: str, creation_id: str) -> None:
+        """Poll a Threads media container until it is FINISHED.
+
+        Threads exposes the ingest state via the container's ``status`` field
+        (values: IN_PROGRESS, FINISHED, ERROR, EXPIRED, PUBLISHED). Video
+        containers stay IN_PROGRESS while Meta transcodes the upload; calling
+        threads_publish before FINISHED returns "media not found".
+        """
+        for _ in range(CONTAINER_POLL_MAX_ATTEMPTS):
+            resp = self._request(
+                "GET",
+                f"{API_BASE}/{creation_id}",
+                access_token=access_token,
+                params={"fields": "status,error_message"},
+            )
+            data = resp.json()
+            status = data.get("status", "")
+
+            if status in ("FINISHED", "PUBLISHED"):
+                return
+            if status in ("ERROR", "EXPIRED"):
+                raise PublishError(
+                    f"Threads container failed: {data.get('error_message', status)}",
+                    platform=self.platform_name,
+                    raw_response=data,
+                )
+
+            time.sleep(CONTAINER_POLL_INTERVAL)
+
+        raise PublishError(
+            "Threads container processing timed out",
+            platform=self.platform_name,
+        )
+
     def _publish_carousel(
         self,
         access_token: str,
@@ -283,10 +357,8 @@ class ThreadsProvider(SocialProvider):
         # Step 1: Create individual item containers
         children_ids: list[str] = []
 
-        for url in content.media_urls:
-            # Determine media type by extension heuristic
-            lower_url = url.lower()
-            if any(lower_url.endswith(ext) for ext in (".mp4", ".mov")):
+        for index, url in enumerate(content.media_urls):
+            if content.is_video(index):
                 media_type = "VIDEO"
                 key = "video_url"
             else:
@@ -307,10 +379,14 @@ class ThreadsProvider(SocialProvider):
             item_id = item_body.get("id")
             if not item_id:
                 raise PublishError(
-                    f"Threads carousel item creation failed: {item_body}",
+                    "Threads carousel item creation failed",
                     platform=self.platform_name,
                     raw_response=item_body,
                 )
+            # Video children ingest asynchronously; wait before they are
+            # referenced by the carousel container.
+            if media_type == "VIDEO":
+                self._wait_for_container(access_token, item_id)
             children_ids.append(item_id)
 
         # Step 2: Create carousel container
@@ -328,10 +404,12 @@ class ThreadsProvider(SocialProvider):
         creation_id = carousel_body.get("id")
         if not creation_id:
             raise PublishError(
-                f"Threads carousel container creation failed: {carousel_body}",
+                "Threads carousel container creation failed",
                 platform=self.platform_name,
                 raw_response=carousel_body,
             )
+
+        self._wait_for_container(access_token, creation_id)
 
         # Step 3: Publish
         publish_resp = self._request(

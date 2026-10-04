@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Literal
 from ninja import Field, Schema
 from pydantic import field_serializer
 
+from providers import is_video_only, requires_media
+
 if TYPE_CHECKING:
     from apps.analytics.derive import DerivedMetric
     from apps.composer.models import PlatformPost, Post
@@ -52,6 +54,15 @@ class AccountSummary(Schema):
         2200,
         description="Maximum caption length the platform accepts. Reject locally before calling /posts.",
     )
+    escaped_chars: str = Field(
+        "",
+        description=(
+            "Characters the platform requires escaped, each costing two against ``char_limit``. "
+            "LinkedIn escapes its reserved little-text set, so count a caption as "
+            "``len(caption) + sum(caption.count(c) for c in escaped_chars)`` before rejecting it. "
+            "Empty for platforms that publish the caption verbatim."
+        ),
+    )
     needs_title: bool = Field(
         False,
         description="True when the platform requires a title (YouTube, Pinterest). When false, the title field is ignored.",
@@ -65,6 +76,21 @@ class AccountSummary(Schema):
             "If false, ``first_comment`` is silently dropped at publish time."
         ),
     )
+    requires_video: bool = Field(
+        False,
+        description=(
+            "True when the platform publishes only video (TikTok, YouTube). Scheduling a post "
+            "with no video in ``media_asset_ids`` is rejected with 422."
+        ),
+    )
+    requires_media: bool = Field(
+        False,
+        description=(
+            "True when the platform can't publish text alone (Instagram, Pinterest, and the "
+            "``requires_video`` platforms). Scheduling a post with no ``media_asset_ids`` is "
+            "rejected with 422."
+        ),
+    )
 
     @classmethod
     def from_social_account(cls, sa) -> AccountSummary:
@@ -75,8 +101,11 @@ class AccountSummary(Schema):
             account_handle=getattr(sa, "account_handle", "") or "",
             connection_status=sa.connection_status,
             char_limit=sa.char_limit,
+            escaped_chars=sa.escaped_chars,
             needs_title=bool(sa.field_config.get("needs_title", False)),
             supports_first_comment=sa.supports_first_comment(),
+            requires_video=is_video_only(sa.platform),
+            requires_media=requires_media(sa.platform),
         )
 
 
@@ -165,6 +194,14 @@ class CreatePostRequest(Schema):
             "Bluesky, Google Business; LinkedIn Personal in OIDC mode)."
         ),
     )
+    internal_notes: str = Field(
+        "",
+        max_length=10_000,
+        description=(
+            "Private team-only note. Never published to any platform; surfaced only "
+            "to your team via the API and the composer."
+        ),
+    )
     media_asset_ids: list[uuid.UUID] = Field(
         default_factory=list,
         description="MediaAsset IDs already uploaded to the workspace's media library. Position-ordered.",
@@ -189,6 +226,14 @@ class CreatePostRequest(Schema):
         None,
         description="UTC timestamp. Required when ``action='schedule'``.",
     )
+    proposed_publish_at: dt.datetime | None = Field(
+        None,
+        description=(
+            "Optional draft-stage suggested publish time (UTC), independent of "
+            "``scheduled_at``. Stored as-is — not validated against the future and "
+            "never queued for publishing; cleared automatically if the post is scheduled."
+        ),
+    )
     idempotency_key: str | None = Field(
         None,
         max_length=128,
@@ -200,10 +245,19 @@ class UpdatePostRequest(Schema):
     caption: str | None = Field(None, max_length=10_000)
     title: str | None = Field(None, max_length=255)
     first_comment: str | None = Field(None, max_length=10_000)
+    internal_notes: str | None = Field(
+        None,
+        max_length=10_000,
+        description="Private team-only note. Omit (or send null) to leave it unchanged.",
+    )
     media_asset_ids: list[uuid.UUID] | None = None
     scheduled_at: dt.datetime | None = Field(
         None,
         description="If the post is currently scheduled, this re-times it. Ignored for drafts.",
+    )
+    proposed_publish_at: dt.datetime | None = Field(
+        None,
+        description="Set a draft's suggested publish time (UTC). Sending null is a no-op (cannot clear via PATCH).",
     )
 
 
@@ -250,36 +304,54 @@ class PostResponse(Schema):
     title: str
     caption: str
     first_comment: str
+    internal_notes: str
     scheduled_at: dt.datetime | None
     published_at: dt.datetime | None
+    proposed_publish_at: dt.datetime | None
     status: str  # derived aggregate
     platform_posts: list[PlatformPostSummary]
     created_at: dt.datetime
     updated_at: dt.datetime
 
-    @field_serializer("scheduled_at", "published_at", "created_at", "updated_at")
+    @field_serializer("scheduled_at", "published_at", "proposed_publish_at", "created_at", "updated_at")
     def _serialize_dt(self, value: dt.datetime | None) -> str | None:
         return _serialize_utc_z(value)
 
     @classmethod
-    def from_post(cls, post: Post) -> PostResponse:
+    def from_post(cls, post: Post, *, include_internal_notes: bool = False) -> PostResponse:
         """Single source of truth for Post → API response shape.
 
         Used by both the REST router and MCP handlers so the two surfaces
         cannot drift. ``post.platform_posts`` should be prefetched with
         ``social_account`` to avoid an N+1.
+
+        ``internal_notes`` is a team-only field. The composer hides it from
+        ``client`` / ``viewer`` workspace roles, so the API/MCP mirror that by
+        redacting it to ``""`` unless ``include_internal_notes`` is set. Call
+        sites derive that flag from the caller's ``create_posts`` permission
+        (see ``_can_view_internal_notes`` in the REST router and MCP handlers).
+        It defaults to ``False`` so a new, unconverted call site fails closed —
+        redacted — rather than leaking notes.
         """
-        platform_posts = [
-            PlatformPostSummary.from_platform_post(pp) for pp in post.platform_posts.select_related("social_account")
-        ]
+        # ``.select_related()`` builds a *new* queryset, which discards any
+        # prefetch cache and re-queries once per post — an N+1 on list views.
+        # Use the cache when the caller prefetched, and fall back otherwise so
+        # an un-prefetched single fetch still avoids a query per child.
+        if "platform_posts" in getattr(post, "_prefetched_objects_cache", {}):
+            children = post.platform_posts.all()
+        else:
+            children = post.platform_posts.select_related("social_account")
+        platform_posts = [PlatformPostSummary.from_platform_post(pp) for pp in children]
         return cls(
             id=post.id,
             workspace_id=post.workspace_id,
             title=post.title,
             caption=post.caption,
             first_comment=post.first_comment,
+            internal_notes=post.internal_notes if include_internal_notes else "",
             scheduled_at=post.scheduled_at,
             published_at=post.published_at,
+            proposed_publish_at=post.proposed_publish_at,
             status=post.status,
             platform_posts=platform_posts,
             created_at=post.created_at,
@@ -399,7 +471,7 @@ class DerivedMetricResponse(Schema):
     """A single derived metric over a rolling window.
 
     Mirrors ``apps.analytics.derive.DerivedMetric`` but with a stable wire
-    shape: agents can rely on every metric carrying the same five fields.
+    shape: agents can rely on every metric carrying the same fields.
     The dataclass itself isn't a Pydantic model, so we route through
     :meth:`from_derived` rather than letting Ninja convert it implicitly.
     """
@@ -411,20 +483,47 @@ class DerivedMetricResponse(Schema):
         ...,
         description=(
             "Aggregate value over the current window. Sum for ``count`` metrics, "
-            "average for ``percent`` and ``minutes`` (since those are already daily rates)."
+            "average of the days with data for ``percent`` and ``minutes`` (since those are already daily rates)."
         ),
     )
     delta: float = Field(
         ...,
-        description="Percent change vs. the previous equal-length window. ``0.0`` when there is no prior baseline.",
+        description=(
+            "Percent change vs. the previous equal-length window, calculated by BrightBean. "
+            "``0.0`` when there is no prior baseline."
+        ),
     )
-    series: list[float] = Field(
+    series: list[float | None] = Field(
         default_factory=list,
-        description="Daily values for the current window, oldest first.",
+        description=(
+            "Daily values for the current window, oldest first. ``null`` for a day the platform "
+            "hasn't reported yet (for example YouTube Analytics' 2-3 day lag), which is not a zero."
+        ),
+    )
+    calculated_by_brightbean: bool = Field(
+        False,
+        description=(
+            "``true`` when BrightBean calculated ``value`` rather than the platform reporting it: the "
+            "engagement rate, daily averages, and estimates. YouTube's developer policies require such "
+            "metrics to be labelled as calculated by BrightBean, not by the platform, wherever they are shown."
+        ),
+    )
+    averaged: bool = Field(False, description="``value`` is BrightBean's average of the platform's daily figures.")
+    estimated: bool = Field(
+        False,
+        description=(
+            "``value`` was estimated by BrightBean from other counts — summed per-post deltas when the "
+            "platform's account-level analytics weren't available or were older, or differences between "
+            "follower totals."
+        ),
     )
 
     @classmethod
-    def from_derived(cls, key: str, label: str, derived: DerivedMetric) -> DerivedMetricResponse:
+    def from_derived(
+        cls, key: str, label: str, derived: DerivedMetric, *, calculated: bool = False
+    ) -> DerivedMetricResponse:
+        """``calculated`` marks a value BrightBean always computes (the
+        engagement rate), on top of what ``derived`` records about itself."""
         return cls(
             key=key,
             label=label,
@@ -432,17 +531,30 @@ class DerivedMetricResponse(Schema):
             value=derived.value,
             delta=derived.delta,
             series=list(derived.series),
+            calculated_by_brightbean=calculated or derived.averaged or derived.estimated,
+            averaged=derived.averaged,
+            estimated=derived.estimated,
         )
 
 
 class EngagementCardResponse(Schema):
     rate: DerivedMetricResponse = Field(
         ...,
-        description="Engagement rate = sum(parts) / denom * 100. The denom is the first available of ``reach, impressions, views, plays``.",
+        description=(
+            "Engagement rate = sum(parts) / denom * 100, calculated by BrightBean. The denom is the "
+            "first of ``views, reach, impressions, plays`` with data, falling back to the follower count."
+        ),
     )
     parts: list[DerivedMetricResponse] = Field(
         default_factory=list,
         description="The component metrics that feed the rate's numerator (likes, comments, shares, …).",
+    )
+    formula: str | None = Field(
+        None,
+        description=(
+            "How the rate was calculated, e.g. ``(Likes + Comments + Shares) ÷ Views``. "
+            "``null`` when there was nothing to divide by yet."
+        ),
     )
 
 
@@ -567,6 +679,127 @@ class PostAnalyticsResponse(Schema):
     title: str
     caption: str
     platform_posts: list[PlatformPostAnalyticsResponse]
+
+
+# ---------------------------------------------------------------------------
+# /inbox — read + reply drafting
+# ---------------------------------------------------------------------------
+
+
+class InboxReplyResponse(Schema):
+    """One outbound reply to an inbox message.
+
+    A reply is created as ``draft``, then a send step delivers it to the
+    platform and moves it to ``sent`` (or ``failed`` with a human-readable
+    ``send_error`` if the platform refused it). ``sent_at`` /
+    ``platform_reply_id`` are populated only once ``status == "sent"``.
+    """
+
+    id: uuid.UUID
+    inbox_message_id: uuid.UUID
+    status: str
+    body: str
+    author_email: str = ""
+    platform_reply_id: str = ""
+    send_error: str = ""
+    created_at: dt.datetime
+    updated_at: dt.datetime
+    sent_at: dt.datetime | None = None
+
+    @field_serializer("created_at", "updated_at", "sent_at")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+    @classmethod
+    def from_reply(cls, reply) -> InboxReplyResponse:
+        author = getattr(reply, "author", None)
+        return cls(
+            id=reply.id,
+            inbox_message_id=reply.inbox_message_id,
+            status=reply.status,
+            body=reply.body,
+            author_email=(getattr(author, "email", "") or ""),
+            platform_reply_id=reply.platform_reply_id or "",
+            send_error=reply.send_error or "",
+            created_at=reply.created_at,
+            updated_at=reply.updated_at,
+            sent_at=reply.sent_at,
+        )
+
+
+class InboxMessageResponse(Schema):
+    """An inbound comment / mention / DM / review in the unified inbox."""
+
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    social_account_id: uuid.UUID
+    platform: str
+    message_type: str
+    status: str
+    sentiment: str
+    sender_name: str
+    sender_handle: str = ""
+    body: str
+    related_post_id: uuid.UUID | None = None
+    received_at: dt.datetime
+    created_at: dt.datetime
+    replies: list[InboxReplyResponse] = Field(default_factory=list)
+
+    @field_serializer("received_at", "created_at")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+    @classmethod
+    def from_message(cls, message, *, include_replies: bool = False) -> InboxMessageResponse:
+        replies: list[InboxReplyResponse] = []
+        if include_replies:
+            if "replies" in getattr(message, "_prefetched_objects_cache", {}):
+                rows = message.replies.all()
+            else:
+                rows = message.replies.select_related("author")
+            replies = [InboxReplyResponse.from_reply(r) for r in rows]
+        return cls(
+            id=message.id,
+            workspace_id=message.workspace_id,
+            social_account_id=message.social_account_id,
+            platform=message.social_account.platform,
+            message_type=message.message_type,
+            status=message.status,
+            sentiment=message.sentiment,
+            sender_name=message.sender_name,
+            sender_handle=message.sender_handle or "",
+            body=message.body or "",
+            related_post_id=message.related_post_id,
+            received_at=message.received_at,
+            created_at=message.created_at,
+            replies=replies,
+        )
+
+
+class InboxMessagesListResponse(Schema):
+    messages: list[InboxMessageResponse]
+    limit: int
+    next_cursor: str | None = None
+
+
+class CreateReplyRequest(Schema):
+    body: str = Field(..., min_length=1, max_length=10_000, description="The reply text.")
+    idempotency_key: str | None = Field(
+        None,
+        max_length=128,
+        description="Optional client-chosen retry key. Same key + same body → replay first response.",
+    )
+    send: bool = Field(
+        False,
+        description=(
+            "When true, immediately deliver the reply to the platform instead of "
+            "leaving it as a draft. Requires the ``reply_from_inbox`` permission."
+        ),
+    )
+
+
+class UpdateReplyRequest(Schema):
+    body: str = Field(..., min_length=1, max_length=10_000, description="Replacement reply text.")
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,15 @@
-"""Tests for TikTokProvider analytics methods (video.list + user.info.stats)."""
+"""Tests for TikTokProvider analytics methods (video.list)."""
 
+import hashlib
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from providers.exceptions import APIError, PublishError
 from providers.tiktok import TikTokProvider
-from providers.types import PostType, PublishContent
+from providers.types import PostType, PublishContent, PublishState
 
 
 def _make_response(payload: dict) -> MagicMock:
@@ -21,6 +23,59 @@ def _date_range() -> tuple[datetime, datetime]:
         datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC),
         datetime(2026, 6, 4, 23, 59, 59, tzinfo=UTC),
     )
+
+
+class TestGetAuthUrl:
+    def test_provider_declares_pkce(self):
+        assert TikTokProvider({"client_key": "k", "client_secret": "s"}).uses_pkce is True
+
+    def test_scopes_are_publish_plus_video_analytics_only(self):
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        url = provider.get_auth_url("https://app.example/cb", "state-123")
+
+        query = parse_qs(urlsplit(url).query)
+        assert query["scope"] == ["user.info.basic,video.publish,video.upload,video.list"]
+
+    def test_includes_pkce_challenge_when_verifier_given(self):
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        url = provider.get_auth_url("https://app.example/cb", "state-123", code_verifier="verifier-xyz")
+
+        query = parse_qs(urlsplit(url).query)
+        # TikTok quirk: code_challenge is the HEX sha256 digest, not base64url.
+        expected = hashlib.sha256(b"verifier-xyz").hexdigest()
+        assert query["code_challenge"] == [expected]
+        assert len(expected) == 64  # hex digest length — guards against base64url (~43 chars)
+        assert query["code_challenge_method"] == ["S256"]
+
+    def test_omits_pkce_when_no_verifier(self):
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        url = provider.get_auth_url("https://app.example/cb", "state-123")
+
+        assert "code_challenge" not in url
+        assert "code_challenge_method" not in url
+
+
+class TestExchangeCode:
+    @patch.object(TikTokProvider, "_request")
+    def test_sends_code_verifier_when_given(self, mock_request):
+        mock_request.return_value = _make_response({"access_token": "tok", "expires_in": 3600})
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        provider.exchange_code("auth-code", "https://app.example/cb", code_verifier="verifier-xyz")
+
+        _, kwargs = mock_request.call_args
+        assert kwargs["data"]["code_verifier"] == "verifier-xyz"
+        assert kwargs["data"]["grant_type"] == "authorization_code"
+
+    @patch.object(TikTokProvider, "_request")
+    def test_omits_code_verifier_when_absent(self, mock_request):
+        mock_request.return_value = _make_response({"access_token": "tok", "expires_in": 3600})
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        provider.exchange_code("auth-code", "https://app.example/cb")
+
+        _, kwargs = mock_request.call_args
+        assert "code_verifier" not in kwargs["data"]
 
 
 class TestGetPostMetrics:
@@ -254,92 +309,27 @@ class TestGetPostMetrics:
 
 class TestGetAccountMetrics:
     @patch.object(TikTokProvider, "_request")
-    def test_request_shape(self, mock_request):
-        mock_request.return_value = _make_response({"data": {"user": {}}})
-
+    def test_returns_empty_without_user_info_request(self, mock_request):
+        # TikTok analytics is video-only. Account follower totals require
+        # user.info.stats, which OAuth no longer requests.
         provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        provider.get_account_metrics("token-xyz", _date_range())
+        metrics = provider.get_account_metrics("token-xyz", _date_range())
 
-        assert mock_request.call_count == 1
-        args, kwargs = mock_request.call_args
-        assert args[0] == "GET"
-        assert args[1] == "https://open.tiktokapis.com/v2/user/info/"
-        assert kwargs["access_token"] == "token-xyz"
-        # date_range is intentionally NOT sent — /v2/user/info/ returns
-        # lifetime totals with no range filter. Only follower_count is
-        # requested; the other user.info.stats fields (likes_count etc.)
-        # are lifetime cumulatives that would inflate engagement_rate if
-        # snapshotted as daily values.
-        assert kwargs["params"] == {"fields": "follower_count"}
-
-    @patch.object(TikTokProvider, "_request")
-    def test_parses_followers(self, mock_request):
-        mock_request.return_value = _make_response({"data": {"user": {"follower_count": 4200}}})
-
-        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        metrics = provider.get_account_metrics("token", _date_range())
-
-        assert metrics.followers == 4200
-        # No extras — TikTok's other lifetime counters would corrupt
-        # engagement_rate if treated as per-day values, so they're not
-        # surfaced until a daily-delta endpoint exists.
+        assert metrics.followers is None
         assert metrics.extra == {}
+        mock_request.assert_not_called()
 
-    @patch.object(TikTokProvider, "_request")
-    def test_zero_followers_still_returns_metrics(self, mock_request):
-        # Brand-new accounts can legitimately have 0 followers; the
-        # AccountMetrics object MUST still carry that value (not None) so
-        # `_account_metrics_to_dict` writes a baseline snapshot.
-        mock_request.return_value = _make_response({"data": {"user": {"follower_count": 0}}})
-
-        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        metrics = provider.get_account_metrics("token", _date_range())
-
-        assert metrics.followers == 0
-
-    @patch.object(TikTokProvider, "_request")
-    def test_missing_user_block_returns_empty(self, mock_request):
-        # Defensive: malformed response shouldn't raise — empty AccountMetrics
-        # lets the sync layer treat it as "no data".
-        mock_request.return_value = _make_response({})
-
-        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        metrics = provider.get_account_metrics("token", _date_range())
-
-        assert metrics.followers == 0
-        assert metrics.extra == {}
-
-    @patch.object(TikTokProvider, "_request")
-    def test_non_numeric_follower_count_does_not_raise(self, mock_request):
-        # Defensive: if TikTok ever returns a non-coercible value (legacy
-        # locales have been seen to return abbreviated strings like "4.2K"),
-        # the provider must not abort the whole sync — fall back to 0.
-        mock_request.return_value = _make_response({"data": {"user": {"follower_count": "unavailable"}}})
-
-        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        metrics = provider.get_account_metrics("token", _date_range())
-
-        assert metrics.followers == 0
-
-    @patch.object(TikTokProvider, "_request")
-    def test_does_not_supports_date_range(self, _mock_request):
-        # The sync layer reads this flag to skip the 3-day backfill loop
-        # for providers whose stats endpoint ignores date_range — otherwise
-        # TikTok's lifetime totals would be replayed into past dates as
-        # if they were historical observations.
+    def test_does_not_supports_date_range(self):
+        # This remains false because account metrics are not date-ranged and
+        # currently not fetched at all.
         provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
         assert provider.account_metrics_supports_date_range is False
 
 
 class TestAccountMetricsPersistence:
-    """Integration check: TikTok ``AccountMetrics`` actually persist to snapshots.
+    """Integration checks for TikTok's video-only analytics catalog."""
 
-    Without these checks, the provider can silently return well-formed
-    ``AccountMetrics`` that the catalog mapper drops on the floor — exactly
-    the Codex finding for issue 2.
-    """
-
-    def test_tiktok_followers_persists(self):
+    def test_tiktok_followers_are_not_persisted(self):
         from apps.analytics.tasks import _account_metrics_to_dict
         from providers.types import AccountMetrics
 
@@ -347,52 +337,23 @@ class TestAccountMetricsPersistence:
 
         out = _account_metrics_to_dict(metrics, "tiktok")
 
-        # Total follower count snapshots under the ``followers`` key the
-        # catalog mapper persists for platforms that list it.
-        assert out["followers"] == 4200.0
-
-    def test_tiktok_zero_followers_persists(self):
-        # Brand-new TikTok account: 0 followers must still be persisted
-        # so the chart series has a baseline (not a gap that jumps to
-        # the first non-zero value).
-        from apps.analytics.tasks import _account_metrics_to_dict
-        from providers.types import AccountMetrics
-
-        metrics = AccountMetrics(followers=0)
-
-        out = _account_metrics_to_dict(metrics, "tiktok")
-
-        assert out["followers"] == 0.0
+        assert "followers" not in out
 
     def test_followers_not_persisted_for_platforms_without_catalog_entry(self):
-        # Instagram/Facebook providers populate ``AccountMetrics.followers``
-        # with daily-delta values (Insights API ``follower_count`` /
-        # ``page_fans``), not lifetime totals. Persisting them under the
-        # ``followers`` key (which the catalog labels as a total) would
-        # mislabel the data. The catalog-membership gate prevents that
-        # leak today; this test pins the contract.
         from apps.analytics.tasks import _account_metrics_to_dict
         from providers.types import AccountMetrics
 
         metrics = AccountMetrics(followers=42)
 
-        for platform in ("instagram", "facebook", "linkedin_company"):
+        for platform in ("facebook", "linkedin_company", "tiktok"):
             out = _account_metrics_to_dict(metrics, platform)
             assert "followers" not in out, f"unexpected followers leak for {platform}"
 
-    def test_tiktok_follower_growth_metric_resolves(self):
-        # Regression guard for the catalog-swap bug: when TikTok's catalog
-        # was changed from ``follows`` to ``followers``, the existing
-        # follower_growth_metric iteration over (``subscribers``, ``follows``)
-        # returned None for TikTok, hiding the new follower data from the
-        # analytics header.
-        from apps.analytics.metrics import PLATFORM_METRICS
+    def test_tiktok_catalog_is_video_only(self):
+        from apps.analytics.metrics import PLATFORM_METRICS, post_metrics_for
 
-        platform_metrics = PLATFORM_METRICS["tiktok"]
-        assert any(m in platform_metrics for m in ("subscribers", "follows", "followers")), (
-            "TikTok must list one of the account-level growth metrics for "
-            "follower_growth_metric to surface follower data in the UI header"
-        )
+        assert PLATFORM_METRICS["tiktok"] == ["views", "likes", "comments", "shares", "engagement"]
+        assert post_metrics_for("tiktok") == ["views", "likes", "comments", "shares", "engagement"]
 
 
 CREATOR_INFO_URL = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
@@ -443,20 +404,34 @@ class TestPublishPost:
         assert result.platform_post_id == "v_pub_url~123"
 
     @patch.object(TikTokProvider, "_request")
-    def test_unaudited_options_block_public_post_before_init(self, mock_request):
-        # Unaudited apps only get SELF_ONLY back — a public post must fail
-        # fast with retryable=False, without ever hitting video/init.
+    def test_unaudited_options_block_explicit_public_post_before_init(self, mock_request):
+        # Unaudited apps only get SELF_ONLY back — an explicitly public post
+        # must fail fast with retryable=False, without ever hitting video/init.
         mock_request.return_value = _creator_info_response(["SELF_ONLY"])
 
         provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
         with pytest.raises(PublishError) as excinfo:
-            provider.publish_post("tok", _video_content())
+            provider.publish_post("tok", _video_content(privacy_level="PUBLIC_TO_EVERYONE"))
 
         assert excinfo.value.retryable is False
         assert "audit" in str(excinfo.value)
         assert "SELF_ONLY" in str(excinfo.value)
         urls = [call.args[1] for call in mock_request.call_args_list]
         assert VIDEO_INIT_URL not in urls
+
+    @patch.object(TikTokProvider, "_request")
+    def test_unaudited_options_use_self_only_for_implicit_default(self, mock_request):
+        mock_request.side_effect = [
+            _creator_info_response(["SELF_ONLY"]),
+            _init_response(),
+        ]
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        result = provider.publish_post("tok", _video_content())
+
+        assert result.platform_post_id == "v_pub_url~123"
+        init_call = mock_request.call_args_list[1]
+        assert init_call.kwargs["json"]["post_info"]["privacy_level"] == "SELF_ONLY"
 
     @patch.object(TikTokProvider, "_request")
     def test_self_only_post_allowed_when_unaudited(self, mock_request):
@@ -471,6 +446,47 @@ class TestPublishPost:
         assert result.platform_post_id == "v_pub_url~123"
         init_call = mock_request.call_args_list[1]
         assert init_call.kwargs["json"]["post_info"]["privacy_level"] == "SELF_ONLY"
+
+    @patch.object(TikTokProvider, "_request")
+    def test_video_over_max_duration_blocked_before_init(self, mock_request):
+        # creator_info caps duration at 600s; a 900s video must fail fast,
+        # non-retryable, without ever calling video/init.
+        mock_request.return_value = _creator_info_response(["PUBLIC_TO_EVERYONE", "SELF_ONLY"])
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        content = PublishContent(
+            text="Hello TikTok",
+            media_urls=["https://cdn.example.com/video.mp4"],
+            post_type=PostType.VIDEO,
+            extra={"privacy_level": "PUBLIC_TO_EVERYONE"},
+            video_duration_sec=900,
+        )
+        with pytest.raises(PublishError) as excinfo:
+            provider.publish_post("tok", content)
+
+        assert excinfo.value.retryable is False
+        assert "600" in str(excinfo.value)
+        urls = [call.args[1] for call in mock_request.call_args_list]
+        assert VIDEO_INIT_URL not in urls
+
+    @patch.object(TikTokProvider, "_request")
+    def test_video_within_max_duration_proceeds(self, mock_request):
+        mock_request.side_effect = [
+            _creator_info_response(["PUBLIC_TO_EVERYONE", "SELF_ONLY"]),
+            _init_response(),
+        ]
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        content = PublishContent(
+            text="Hello TikTok",
+            media_urls=["https://cdn.example.com/video.mp4"],
+            post_type=PostType.VIDEO,
+            extra={"privacy_level": "PUBLIC_TO_EVERYONE"},
+            video_duration_sec=120,
+        )
+        result = provider.publish_post("tok", content)
+
+        assert result.platform_post_id == "v_pub_url~123"
 
     @patch.object(TikTokProvider, "_request")
     def test_creator_info_failure_does_not_block_publish(self, mock_request):
@@ -556,10 +572,134 @@ class TestPublishPost:
         assert "brand_organic_toggle" not in post_info
 
     @patch.object(TikTokProvider, "_request")
+    def test_video_cover_timestamp_forwarded_as_int(self, mock_request):
+        mock_request.side_effect = [
+            _creator_info_response(["PUBLIC_TO_EVERYONE"]),
+            _init_response(),
+        ]
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        provider.publish_post("tok", _video_content(video_cover_timestamp_ms="12500"))
+
+        post_info = mock_request.call_args_list[1].kwargs["json"]["post_info"]
+        assert post_info["video_cover_timestamp_ms"] == 12500
+
+    @patch.object(TikTokProvider, "_request")
+    def test_video_cover_timestamp_invalid_or_absent_omitted(self, mock_request):
+        mock_request.side_effect = [
+            _creator_info_response(["PUBLIC_TO_EVERYONE"]),
+            _init_response(),
+            _creator_info_response(["PUBLIC_TO_EVERYONE"]),
+            _init_response(),
+        ]
+
+        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
+        provider.publish_post("tok", _video_content(video_cover_timestamp_ms="not-a-number"))
+        provider.publish_post("tok", _video_content())
+
+        first = mock_request.call_args_list[1].kwargs["json"]["post_info"]
+        second = mock_request.call_args_list[3].kwargs["json"]["post_info"]
+        assert "video_cover_timestamp_ms" not in first
+        assert "video_cover_timestamp_ms" not in second
+
+    @patch.object(TikTokProvider, "_request")
     def test_invalid_privacy_level_rejected_without_requests(self, mock_request):
         provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
         with pytest.raises(PublishError) as excinfo:
             provider.publish_post("tok", _video_content(privacy_level="BOGUS"))
 
         assert excinfo.value.retryable is False
+        mock_request.assert_not_called()
+
+
+class TestCheckPublishStatus:
+    """TikTok only accepts the upload; publishing happens afterwards."""
+
+    def test_provider_declares_async_publish(self):
+        assert TikTokProvider({"client_key": "k", "client_secret": "s"}).publish_is_async is True
+
+    @patch.object(TikTokProvider, "_request")
+    def test_complete_returns_the_real_video_id(self, mock_request):
+        mock_request.return_value = _make_response(
+            {"data": {"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": [7412345678901234567]}}
+        )
+        status = TikTokProvider({}).check_publish_status("tok", "v_pub_file~abc")
+
+        assert status.state is PublishState.COMPLETE
+        assert status.platform_post_id == "7412345678901234567"
+        assert status.error == ""
+
+    @patch.object(TikTokProvider, "_request")
+    def test_failed_carries_tiktoks_own_reason(self, mock_request):
+        mock_request.return_value = _make_response(
+            {"data": {"status": "FAILED", "fail_reason": "video_format_check_failed"}}
+        )
+        status = TikTokProvider({}).check_publish_status("tok", "v_pub_file~abc")
+
+        assert status.state is PublishState.FAILED
+        assert "video_format_check_failed" in status.error
+
+    @patch.object(TikTokProvider, "_request")
+    def test_processing_is_pending_not_an_outcome(self, mock_request):
+        mock_request.return_value = _make_response({"data": {"status": "PROCESSING_UPLOAD"}})
+
+        assert TikTokProvider({}).check_publish_status("tok", "v_pub_file~abc").state is PublishState.PENDING
+
+    @patch.object(TikTokProvider, "_request")
+    def test_unknown_future_status_is_pending_not_failed(self, mock_request):
+        """A status TikTok adds later must make us wait, not declare an outcome."""
+        mock_request.return_value = _make_response({"data": {"status": "SOMETHING_NEW"}})
+
+        assert TikTokProvider({}).check_publish_status("tok", "v_pub_file~abc").state is PublishState.PENDING
+
+    @patch.object(TikTokProvider, "_request")
+    def test_inbox_tells_the_user_to_finish_in_the_app(self, mock_request):
+        mock_request.return_value = _make_response({"data": {"status": "SEND_TO_USER_INBOX"}})
+        status = TikTokProvider({}).check_publish_status("tok", "v_inbox_file~abc")
+
+        assert status.state is PublishState.INBOX
+        assert "TikTok app" in status.error
+
+
+class TestFileUploadStreaming:
+    """The video is streamed off disk, never read into memory."""
+
+    @patch.object(TikTokProvider, "_check_creator_constraints", side_effect=lambda t, p, c, **kw: p)
+    @patch.object(TikTokProvider, "_request")
+    def test_upload_body_is_a_file_object_with_content_length(self, mock_request, _constraints, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\0" * 2048)
+        mock_request.return_value = _make_response(
+            {"data": {"publish_id": "v_pub_file~x", "upload_url": "https://upload.tiktok/x"}}
+        )
+
+        TikTokProvider({}).publish_post(
+            "tok",
+            PublishContent(text="hi", post_type=PostType.VIDEO, media_files=[str(video)]),
+        )
+
+        put_call = [c for c in mock_request.call_args_list if c.args[0] == "PUT"][0]
+        body = put_call.kwargs["data"]
+        assert hasattr(body, "read"), "video must be handed to httpx as a stream, not bytes"
+        assert put_call.kwargs["headers"]["Content-Length"] == "2048"
+
+    @patch.object(TikTokProvider, "_check_creator_constraints", side_effect=lambda t, p, c, **kw: p)
+    @patch.object(TikTokProvider, "_request")
+    def test_oversize_video_fails_permanently_with_the_real_reason(self, mock_request, _constraints, tmp_path):
+        """Retrying can't shrink the file; burning the budget hides why it failed."""
+        video = tmp_path / "huge.mp4"
+        video.write_bytes(b"\0" * 16)
+
+        with (
+            patch("providers.tiktok.os.path.getsize", return_value=90_000_000),
+            pytest.raises(PublishError) as exc,
+        ):
+            TikTokProvider({}).publish_post(
+                "tok",
+                PublishContent(text="hi", post_type=PostType.VIDEO, media_files=[str(video)]),
+            )
+
+        assert exc.value.retryable is False
+        assert "90 MB" in str(exc.value)
+        assert "64 MB" in str(exc.value)
         mock_request.assert_not_called()

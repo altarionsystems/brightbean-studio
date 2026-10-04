@@ -13,6 +13,10 @@ _WORKFLOW_ORDER = [
     "draft",
     "changes_requested",
     "rejected",
+    # A client-requested hold is action-required, so it ranks low (wins over
+    # approved/scheduled) — a partially-held post surfaces as "on_hold" rather
+    # than letting an un-held sibling mask it at the Post level.
+    "on_hold",
     "pending_review",
     "pending_client",
     "approved",
@@ -24,6 +28,14 @@ _WORKFLOW_ORDER = [
 
 # Statuses considered "terminal publishing outcomes".
 _TERMINAL = {"published", "failed"}
+
+# Aggregate statuses where the post is live (or going live) and the composer
+# must stop offering to change it. Deliberately narrower than
+# ``Post.is_editable``, which also excludes ``failed``, ``pending_review``,
+# ``pending_client`` and ``on_hold``: a failed channel still needs its publish
+# affordances to retry, and a post out for review is still being worked on.
+# Clone is the escape hatch for anything in here.
+READONLY_STATUSES = frozenset({"publishing", "partially_published", "published"})
 
 
 def derive_post_status(statuses):
@@ -64,4 +76,10 @@ def derive_post_status(statuses):
         except ValueError:
             return len(_WORKFLOW_ORDER)
 
-    return min(unique, key=_rank)
+    result = min(unique, key=_rank)
+    # A client hold ranks low so it surfaces over approved/scheduled siblings, but
+    # it must not shadow a channel that has already published — report the partial
+    # outcome instead of hiding "published" behind "on_hold".
+    if result == "on_hold" and "published" in unique:
+        return "partially_published"
+    return result

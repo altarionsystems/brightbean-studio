@@ -1,18 +1,33 @@
 """Background tasks for the Content Calendar (F-2.3)."""
 
+import copy
 import logging
-from datetime import timedelta
+import zoneinfo
+from datetime import datetime, timedelta
 
 from dateutil.relativedelta import relativedelta
 from django.utils import timezone
 
 from apps.composer.models import PlatformPost, Post, PostMedia
+from apps.composer.services import post_media_types, publish_blocker
 
 from .models import RecurrenceRule
 
 logger = logging.getLogger(__name__)
 
 LOOKAHEAD_DAYS = 90
+
+# Source rows whose future occurrences are still meant to publish on their own.
+# A row the team pulled back to draft, put on hold, or sent for review or
+# rejected has not committed its recurrences either, so those clone as drafts.
+_RECURRING_COMMITTED_STATUSES = frozenset(
+    {
+        PlatformPost.Status.SCHEDULED,
+        PlatformPost.Status.PUBLISHING,
+        PlatformPost.Status.PUBLISHED,
+        PlatformPost.Status.FAILED,
+    }
+)
 
 
 def generate_recurring_posts():
@@ -24,7 +39,6 @@ def generate_recurring_posts():
     """
     rules = RecurrenceRule.objects.filter(is_active=True).select_related("post")
     now = timezone.now()
-    cutoff = now.date() + timedelta(days=LOOKAHEAD_DAYS)
     generated_total = 0
 
     for rule in rules:
@@ -32,38 +46,48 @@ def generate_recurring_posts():
         if not source.scheduled_at:
             continue
 
-        # Respect end_date
+        # Recurrence dates and times are computed in the post's workspace
+        # timezone so the wall-clock time is preserved across DST boundaries
+        # (a 09:00-local series stays at 09:00 local, not drifting by the DST
+        # offset). ``scheduled_at`` is stored as UTC, so convert it back first.
+        ws_tz = zoneinfo.ZoneInfo(source.workspace.effective_timezone or "UTC")
+        local_start = source.scheduled_at.astimezone(ws_tz)
+        base_date = local_start.date()
+        base_time = local_start.time()
+        today_local = now.astimezone(ws_tz).date()
+
+        # Bound the lookahead horizon in the workspace's local calendar so it
+        # lands on the same local day for every timezone, not the UTC date.
+        cutoff = today_local + timedelta(days=LOOKAHEAD_DAYS)
         end = rule.end_date or cutoff
         if end > cutoff:
             end = cutoff
 
-        # Compute recurrence dates
-        base_date = source.scheduled_at.date()
-        base_time = source.scheduled_at.time()
-        base_tz = source.scheduled_at.tzinfo
-
         dates = _compute_recurrence_dates(base_date, rule.frequency, rule.interval, end)
 
-        # Filter out dates already generated (posts with same source scheduled time)
-        existing_dates = set(
-            Post.objects.filter(
-                workspace=source.workspace,
-                caption=source.caption,
-                scheduled_at__date__in=dates,
+        # Filter out dates already generated (posts with same source caption).
+        # Extract dates in the workspace zone so they line up with the ws-local
+        # recurrence dates above rather than UTC calendar days.
+        with timezone.override(ws_tz):
+            existing_dates = set(
+                Post.objects.filter(
+                    workspace=source.workspace,
+                    caption=source.caption,
+                    scheduled_at__date__in=dates,
+                )
+                .exclude(id=source.id)
+                .values_list("scheduled_at__date", flat=True)
             )
-            .exclude(id=source.id)
-            .values_list("scheduled_at__date", flat=True)
-        )
+
+        # Every clone carries the source's media, so one answer serves each
+        # recurrence date and platform of this rule.
+        media_types = post_media_types(source)
 
         for d in dates:
-            if d in existing_dates or d <= now.date():
+            if d in existing_dates or d <= today_local:
                 continue
 
-            from datetime import datetime
-
-            scheduled_dt = datetime.combine(d, base_time)
-            if base_tz:
-                scheduled_dt = scheduled_dt.replace(tzinfo=base_tz)
+            scheduled_dt = datetime.combine(d, base_time).replace(tzinfo=ws_tz)
 
             # Clone the post
             new_post = Post.objects.create(
@@ -78,10 +102,25 @@ def generate_recurring_posts():
             )
 
             # Clone platform posts in bulk, preserving per-platform offsets
-            source_pps = list(source.platform_posts.all())
+            source_pps = list(source.platform_posts.select_related("social_account"))
             if source_pps:
                 new_pps = []
                 for pp in source_pps:
+                    # The source was checked when it was scheduled, but its media
+                    # or board can have gone since. A clone that can only fail is
+                    # left as a draft at its date: still on the calendar to fix,
+                    # but not handed to the publisher.
+                    blocked = publish_blocker(
+                        pp.social_account, media_types=media_types, platform_extra=pp.platform_extra
+                    )
+                    if blocked:
+                        logger.warning(
+                            "Recurrence of post %s on %s left as a draft for %s: %s",
+                            source.id,
+                            d,
+                            pp.social_account_id,
+                            blocked,
+                        )
                     # Preserve the offset between source PP's scheduled_at and
                     # source post's scheduled_at, so per-platform time deltas
                     # carry into each recurrence.
@@ -96,8 +135,15 @@ def generate_recurring_posts():
                             platform_specific_caption=pp.platform_specific_caption,
                             platform_specific_first_comment=pp.platform_specific_first_comment,
                             platform_specific_media=pp.platform_specific_media,
+                            # Carry per-platform settings (e.g. TikTok privacy level,
+                            # comment/duet/stitch toggles, disclosure flags) into each
+                            # recurrence. Without this the publisher falls back to
+                            # provider defaults and loses the creator's choices.
+                            platform_extra=copy.deepcopy(pp.platform_extra) if pp.platform_extra else {},
                             scheduled_at=pp_scheduled,
-                            status="scheduled",
+                            status=(
+                                "scheduled" if pp.status in _RECURRING_COMMITTED_STATUSES and not blocked else "draft"
+                            ),
                         )
                     )
                 PlatformPost.objects.bulk_create(new_pps)

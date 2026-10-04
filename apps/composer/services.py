@@ -12,7 +12,9 @@ status transitions so audit + idempotency live in one place.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -30,6 +32,18 @@ def sync_post_scheduled_at(post):
       ``Post.scheduled_at`` lingered at the old value and the post
       kept appearing as scheduled in the UI.
     * No children, parent already null → no-op.
+
+    A post that gains a committed schedule also drops any draft-stage
+    ``proposed_publish_at``: this is the chokepoint the scheduling paths flow
+    through (``create_post``, ``transition_platform_post`` for the REST
+    ``/schedule`` route and the MCP ``schedule_draft`` tool, and the PATCH
+    re-time which calls this after saving), so the suggestion and a real
+    schedule never coexist. The ``scheduled_at`` aggregate logic is unchanged —
+    the publisher's ``Coalesce(scheduled_at, post__scheduled_at)`` fallback
+    depends on it — so only the proposal clear is added here. The one path that
+    commits a child WITHOUT a ``scheduled_at`` (the composer's per-account chip
+    endpoint) clears the proposal itself rather than routing through here, to
+    avoid disturbing that aggregate.
     """
     times = list(post.platform_posts.exclude(scheduled_at__isnull=True).values_list("scheduled_at", flat=True))
     if not times:
@@ -38,9 +52,15 @@ def sync_post_scheduled_at(post):
             post.save(update_fields=["scheduled_at", "updated_at"])
         return
     earliest = min(times)
+    update_fields = []
     if post.scheduled_at != earliest:
         post.scheduled_at = earliest
-        post.save(update_fields=["scheduled_at", "updated_at"])
+        update_fields.append("scheduled_at")
+    if post.proposed_publish_at is not None:
+        post.proposed_publish_at = None
+        update_fields.append("proposed_publish_at")
+    if update_fields:
+        post.save(update_fields=[*update_fields, "updated_at"])
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +79,9 @@ def create_post(
     media_asset_ids: Iterable[Any] | None = None,
     title: str = "",
     first_comment: str = "",
+    internal_notes: str = "",
     scheduled_at: dt.datetime | None = None,
+    proposed_publish_at: dt.datetime | None = None,
     author=None,
     status: str = "draft",
     platform_overrides: dict[Any, dict[str, str | None]] | None = None,
@@ -81,6 +103,9 @@ def create_post(
       ``scheduled_at`` is accepted and will fire on the very next tick,
       but the caller almost certainly meant "now-ish" so we leave the
       decision to them.
+    * ``proposed_publish_at`` is an optional draft-stage suggestion. It is
+      stored as-is regardless of ``status`` and carries no future-time
+      requirement — it never reaches the publisher.
     * ``social_account.workspace_id`` must equal ``workspace.id``. The
       caller (auth class / view) already enforced scope, but we
       double-check here so anyone reaching the service directly can't
@@ -124,13 +149,39 @@ def create_post(
     media_ids = list(media_asset_ids or [])
     # Pull and validate all referenced assets in a single query — fail
     # closed if any ID is missing or belongs to a different workspace.
-    asset_map: dict[Any, MediaAsset] = {}
+    #
+    # Normalize every id to a ``UUID`` for keying/lookup so all caller shapes
+    # match identically: UUID objects (REST, coerced by Pydantic) and UUID
+    # *strings* in any form (MCP, off the JSON-RPC wire — including uppercase or
+    # braced). A raw string never compares equal to a UUID key, so without this
+    # MCP-supplied assets are wrongly rejected as "not found in workspace".
+    asset_map: dict[uuid.UUID, MediaAsset] = {}
+    resolved: list[tuple[Any, uuid.UUID | None]] = []
     if media_ids:
-        found = list(MediaAsset.objects.filter(id__in=media_ids, workspace=workspace))
+
+        def _to_uuid(value):
+            try:
+                return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+            except (ValueError, TypeError, AttributeError):
+                return None
+
+        resolved = [(mid, _to_uuid(mid)) for mid in media_ids]
+        found = list(MediaAsset.objects.filter(id__in=[u for _, u in resolved if u is not None], workspace=workspace))
         asset_map = {a.id: a for a in found}
-        missing = [mid for mid in media_ids if mid not in asset_map]
+        missing = [mid for mid, u in resolved if u is None or u not in asset_map]
         if missing:
             raise ValueError(f"Media asset(s) not found in workspace {workspace.id}: {missing}")
+
+    if status == "scheduled":
+        # A new post has no platform_extra, so a Pinterest pin has no board
+        # yet and is refused here: it can be created as a draft, given a
+        # board in the composer, and scheduled from there.
+        reason = publish_blocker(
+            social_account,
+            media_types=usable_media_types(asset_map.values()),
+        )
+        if reason:
+            raise ValueError(reason)
 
     override = (platform_overrides or {}).get(social_account.id) or {}
 
@@ -141,7 +192,12 @@ def create_post(
             title=title,
             caption=caption,
             first_comment=first_comment,
+            internal_notes=internal_notes,
             scheduled_at=scheduled_at if status == "scheduled" else None,
+            # A proposal is plain draft metadata — keep it independent of
+            # ``status`` (unlike ``scheduled_at``, which only exists once the
+            # post is committed to the publisher).
+            proposed_publish_at=proposed_publish_at,
         )
         # Each override field is independent: ``None`` (or omitted)
         # means "no platform-specific override; fall back to the post
@@ -156,10 +212,13 @@ def create_post(
             platform_specific_caption=override.get("caption"),
             platform_specific_first_comment=override.get("first_comment"),
         )
-        for position, mid in enumerate(media_ids):
+        for position, (_mid, u) in enumerate(resolved):
+            # ``u`` is validated non-None and present in ``asset_map`` above
+            # (the ``missing`` check raises otherwise); narrow for mypy.
+            assert u is not None
             PostMedia.objects.create(
                 post=post,
-                media_asset=asset_map[mid],
+                media_asset=asset_map[u],
                 position=position,
             )
 
@@ -192,6 +251,8 @@ def transition_platform_post(
     """
     from django.db import transaction
 
+    from apps.composer.models import PlatformPost
+
     # Approval workflow gate — Codex review (PR #53) flagged that the
     # ``POST /posts/{id}/schedule`` route reached this function with
     # ``target_status="scheduled"`` and bypassed the approval check
@@ -201,6 +262,7 @@ def transition_platform_post(
     # view) is covered.
     if target_status == "scheduled":
         _require_approval_gate_passes(platform_post.post.workspace)
+        require_publishable(platform_post)
 
     with transaction.atomic():
         platform_post.transition_to(target_status)
@@ -209,7 +271,10 @@ def transition_platform_post(
         # Without this every API/MCP-driven transition would leave
         # ``PlatformPost.updated_at`` frozen at creation time, breaking
         # any "modified since X" sync and ORDER BY updated_at view.
-        update_fields = {"status", "updated_at"}
+        # TRANSITION_FIELDS covers everything transition_to writes (the retry
+        # budget and the publish handle, not just status), so the REST/MCP
+        # scheduling path persists the same reset the composer does.
+        update_fields = {*PlatformPost.TRANSITION_FIELDS, "updated_at"}
         if target_status == "scheduled":
             if scheduled_at is not None:
                 platform_post.scheduled_at = scheduled_at
@@ -218,12 +283,79 @@ def transition_platform_post(
             if platform_post.scheduled_at is not None:
                 platform_post.scheduled_at = None
                 update_fields.add("scheduled_at")
+            # A drafted child is no longer queued — drop its QueueEntry so the
+            # slot frees as a gap. Covers cancel / unschedule paths that would
+            # otherwise orphan the row with a stale assigned_slot_datetime.
+            from apps.calendar.models import QueueEntry
+
+            QueueEntry.objects.filter(
+                post=platform_post.post,
+                queue__social_account=platform_post.social_account,
+            ).delete()
         elif target_status == "published":
             update_fields.add("published_at")  # set by transition_to
         platform_post.save(update_fields=list(update_fields))
 
     sync_post_scheduled_at(platform_post.post)
     return platform_post
+
+
+def clone_post(post, *, author=None):
+    """Create a fresh DRAFT duplicate of *post* (Clone / Repost).
+
+    Copies caption, title, first comment, internal notes, tags, category, every
+    per-platform override (``platform_specific_*`` + ``platform_extra``) and all
+    media attachments. The copy starts as a ``draft`` with no schedule, so a
+    published (or any) post can be re-edited and re-queued without touching the
+    original. ``author`` defaults to the source author.
+    """
+    from django.db import transaction
+
+    from apps.composer.models import PlatformPost, Post, PostMedia
+
+    with transaction.atomic():
+        new_post = Post.objects.create(
+            workspace=post.workspace,
+            author=author or post.author,
+            title=(f"Copy of {post.title}" if post.title else ""),
+            caption=post.caption,
+            first_comment=post.first_comment,
+            internal_notes=post.internal_notes,
+            tags=post.tags,
+            category=post.category,
+        )
+        children = list(post.platform_posts.all())
+        if children:
+            PlatformPost.objects.bulk_create(
+                [
+                    PlatformPost(
+                        post=new_post,
+                        social_account=pp.social_account,
+                        status="draft",
+                        platform_specific_title=pp.platform_specific_title,
+                        platform_specific_caption=pp.platform_specific_caption,
+                        platform_specific_first_comment=pp.platform_specific_first_comment,
+                        platform_specific_media=copy.deepcopy(pp.platform_specific_media),
+                        platform_extra=copy.deepcopy(pp.platform_extra) if pp.platform_extra else {},
+                    )
+                    for pp in children
+                ]
+            )
+        media = list(post.media_attachments.all())
+        if media:
+            PostMedia.objects.bulk_create(
+                [
+                    PostMedia(
+                        post=new_post,
+                        media_asset=pm.media_asset,
+                        position=pm.position,
+                        alt_text=pm.alt_text,
+                        platform_overrides=copy.deepcopy(pm.platform_overrides),
+                    )
+                    for pm in media
+                ]
+            )
+    return new_post
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +382,116 @@ def _require_approval_gate_passes(workspace) -> None:
             "Workspace requires approval before scheduling; create the post as a "
             "draft and route it through the approval workflow."
         )
+
+
+def usable_media_types(assets) -> set[str]:
+    """The media types among ``assets`` the publisher will actually upload.
+
+    It skips an attachment whose asset has no stored file, so one of those
+    can't satisfy a platform that needs media — or a video.
+    """
+    return {asset.media_type for asset in assets if asset.file}
+
+
+def _usable_attachments():
+    """``PostMedia`` rows ``usable_media_types`` would count, as a queryset."""
+    from apps.composer.models import PostMedia
+
+    return PostMedia.objects.exclude(media_asset__file="")
+
+
+def post_media_types(post, *, excluding=None) -> set[str]:
+    """``usable_media_types`` for ``post``'s attachments, in one query.
+
+    ``excluding`` (a ``PostMedia``) answers for the post as it would be once
+    that attachment is removed.
+    """
+    attachments = _usable_attachments().filter(post_id=post.pk)
+    if excluding is not None:
+        attachments = attachments.exclude(pk=excluding.pk)
+    return set(attachments.values_list("media_asset__media_type", flat=True).distinct())
+
+
+def media_types_by_post(post_ids) -> dict:
+    """``post_media_types`` for many posts in one query; absent ids have none."""
+    by_post: dict = {}
+    rows = _usable_attachments().filter(post_id__in=post_ids).values_list("post_id", "media_asset__media_type")
+    for post_id, media_type in rows.distinct():
+        by_post.setdefault(post_id, set()).add(media_type)
+    return by_post
+
+
+def media_blocker(social_account, *, media_types) -> str:
+    """Why ``social_account`` can't publish a post with these media, or "".
+
+    TikTok and YouTube publish only video; Instagram and Pinterest need an
+    image or a video. Their providers refuse anything else before calling out.
+    """
+    from apps.media_library.models import MediaAsset
+    from providers import is_video_only, requires_media
+
+    platform = social_account.get_platform_display()
+    if is_video_only(social_account.platform) and MediaAsset.MediaType.VIDEO not in media_types:
+        return f"{platform} can only publish videos. Add a video to this post before scheduling it."
+    if requires_media(social_account.platform) and not media_types:
+        return f"{platform} needs an image or a video. Add one to this post before scheduling it."
+    return ""
+
+
+def publish_blocker(social_account, *, media_types, platform_extra: dict | None = None) -> str:
+    """Why a post can't publish to ``social_account`` as it stands, or "".
+
+    The one statement of this rule. The publisher checks it before calling a
+    platform, and every path that schedules a post checks it first so the user
+    hears about it then rather than after the post's other platforms have gone
+    out. Only failures that are certain before the platform is ever called: the
+    media a platform can't do without (``media_blocker``), and a pin with no
+    board, which our own Pinterest provider refuses.
+    """
+    reason = media_blocker(social_account, media_types=media_types)
+    if reason:
+        return reason
+    if social_account.platform == "pinterest" and not (platform_extra or {}).get("board_id"):
+        return "Pinterest needs a board for every pin. Choose one for this post in the composer before scheduling it."
+    return ""
+
+
+def require_publishable(platform_post, *, media_types=None) -> None:
+    """Raise ``ValueError`` if ``platform_post`` is certain to fail at publish time.
+
+    ``media_types`` lets a caller checking many rows answer it for all of them
+    in one query (``media_types_by_post``) instead of one per row.
+    """
+    if media_types is None:
+        media_types = post_media_types(platform_post.post)
+    reason = publish_blocker(
+        platform_post.social_account,
+        media_types=media_types,
+        platform_extra=platform_post.platform_extra,
+    )
+    if reason:
+        raise ValueError(reason)
+
+
+def media_change_blocker(post, *, media_types_after) -> str:
+    """Why a media change would strand a scheduled row, or "".
+
+    Scheduling checks the post as it stood then; this stops the media a
+    platform needs being taken away afterwards — the video from a TikTok post,
+    the last image from a pin — which would leave the row queued to fail. Only
+    rows already ``scheduled`` count; anything else is checked again when it is
+    scheduled.
+    """
+    from apps.composer.models import PlatformPost
+    from providers import is_video_only
+
+    children = post.platform_posts.filter(status=PlatformPost.Status.SCHEDULED).select_related("social_account")
+    for child in children:
+        if media_blocker(child.social_account, media_types=media_types_after):
+            platform = child.social_account.get_platform_display()
+            need = "a video" if is_video_only(child.social_account.platform) else "an image or a video"
+            return (
+                f"This post is scheduled to {platform}, which needs {need} on it. "
+                f"Keep one on the post, or unschedule it for {platform} first."
+            )
+    return ""

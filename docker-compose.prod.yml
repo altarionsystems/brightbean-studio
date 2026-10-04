@@ -35,28 +35,6 @@ services:
   postgres:
     restart: unless-stopped
 
-  maintenance:
-    build: .
-    command: >
-      sh -c "
-      while true; do
-        echo \"[maintenance] $$(date): Running clearsessions...\"
-        python manage.py clearsessions
-        echo \"[maintenance] $$(date): Running media cleanup...\"
-        python manage.py cleanup_orphaned_media --once --min-age-days 14
-        echo \"[maintenance] $$(date): Done. Sleeping 24h.\"
-        sleep 86400
-      done
-      "
-    volumes:
-      - media_data:/app/media
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings.production
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    restart: unless-stopped
-
   caddy:
     image: caddy:2-alpine
     ports:
@@ -66,6 +44,13 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
+      # Read-only so Caddy can serve uploads but never write into MEDIA_ROOT.
+      - media_data:/app/media:ro
+    environment:
+      # Set CADDY_MEDIA_ROOT=/var/empty in .env when STORAGE_BACKEND=s3: the
+      # named volume outlives the switch, and Caddy cannot read Django's
+      # SERVE_MEDIA. See the Caddyfile.
+      - CADDY_MEDIA_ROOT=${CADDY_MEDIA_ROOT:-/app/media}
     depends_on:
       - app
     restart: unless-stopped

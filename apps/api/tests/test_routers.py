@@ -204,6 +204,27 @@ class TestCreatePost:
         assert Post.objects.count() == 1
         assert PlatformPost.objects.filter(status="draft").count() == 1
 
+    def test_create_draft_with_internal_notes(self, client_with_token, social_account):
+        r = client_with_token.post(
+            "/api/v1/posts/",
+            data=json.dumps(
+                {
+                    "social_account_id": str(social_account.id),
+                    "caption": "Has a private note.",
+                    "internal_notes": "Approved by legal; ship Monday.",
+                    "action": "draft",
+                }
+            ),
+            content_type="application/json",
+        )
+        assert r.status_code == 201, r.content
+        body = r.json()
+        assert body["internal_notes"] == "Approved by legal; ship Monday."
+        # Persisted on the model; the team note never leaks into the public caption.
+        post = Post.objects.get(id=body["id"])
+        assert post.internal_notes == "Approved by legal; ship Monday."
+        assert post.caption == "Has a private note."
+
     def test_create_scheduled_requires_scheduled_at(self, client_with_token, social_account):
         r = client_with_token.post(
             "/api/v1/posts/",
@@ -250,6 +271,49 @@ class TestCreatePost:
         )
         assert r.status_code == 403
         assert "allowlist" in r.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# internal_notes visibility
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestInternalNotesVisibility:
+    """``internal_notes`` is a team-only field. The shared ``PostResponse``
+    serializer must redact it for callers without ``create_posts`` — the API
+    analogue of the composer hiding it from client/viewer roles — even though
+    reads aren't otherwise permission-gated.
+    """
+
+    def _post_with_note(self, workspace, user, social_account, note="eyes only"):
+        post = Post.objects.create(workspace=workspace, author=user, caption="public", internal_notes=note)
+        PlatformPost.objects.create(post=post, social_account=social_account, status="draft")
+        return post
+
+    def test_create_posts_caller_sees_internal_notes(self, client_with_token, workspace, user, social_account):
+        post = self._post_with_note(workspace, user, social_account)
+        r = client_with_token.get(f"/api/v1/posts/{post.id}")
+        assert r.status_code == 200, r.content
+        assert r.json()["internal_notes"] == "eyes only"
+
+    def test_caller_without_create_posts_gets_redacted_notes(self, user, owner_memberships, workspace, social_account):
+        # A key that can read posts (allowlisted) but lacks create_posts — the
+        # API analogue of a client/viewer-role member.
+        readonly = services.issue_api_key(
+            workspace=workspace,
+            social_accounts=[social_account],
+            issued_by=user,
+            name="readonly",
+            permissions=["view_analytics"],  # deliberately omits create_posts
+        )
+        client = _SecureClient(HTTP_AUTHORIZATION=f"Bearer {readonly.plaintext_token}")
+        post = self._post_with_note(workspace, user, social_account)
+        r = client.get(f"/api/v1/posts/{post.id}")
+        assert r.status_code == 200, r.content
+        body = r.json()
+        assert body["internal_notes"] == ""  # redacted
+        assert body["caption"] == "public"  # other fields unaffected
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +561,18 @@ class TestPlatformQuota:
             )
             assert r.status_code == 201
 
-        # Now schedule one — must succeed.
+        # Now schedule one — must succeed. With an image, which Instagram
+        # needs before anything will be scheduled to it.
+        from apps.media_library.models import MediaAsset
+
+        image = MediaAsset.objects.create(
+            organization=ig_account.workspace.organization,
+            workspace=ig_account.workspace,
+            file="test/photo.jpg",
+            filename="photo.jpg",
+            media_type=MediaAsset.MediaType.IMAGE,
+            mime_type="image/jpeg",
+        )
         when = (timezone.now() + timedelta(hours=1)).isoformat()
         r = ig_client.post(
             "/api/v1/posts/",
@@ -507,6 +582,7 @@ class TestPlatformQuota:
                     "caption": "this one should succeed",
                     "action": "schedule",
                     "scheduled_at": when,
+                    "media_asset_ids": [str(image.id)],
                 }
             ),
             content_type="application/json",
@@ -599,3 +675,105 @@ class TestFailedAuthThrottle:
         r = c.get("/api/v1/me/")
         assert r.status_code == 401
         assert call_count["n"] == _AUTH_FAIL_LIMIT, "verify_token was called past the throttle threshold"
+
+
+# ---------------------------------------------------------------------------
+# proposed_publish_at — optional draft-stage suggestion on /posts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestProposedPublishAt:
+    _WHEN = "2027-09-01T09:00:00Z"
+
+    def _create_draft(self, client, social_account, **extra):
+        payload = {
+            "social_account_id": str(social_account.id),
+            "caption": "hi",
+            "action": "draft",
+            **extra,
+        }
+        return client.post("/api/v1/posts/", data=json.dumps(payload), content_type="application/json")
+
+    def test_create_draft_echoes_and_persists_proposed(self, client_with_token, social_account):
+        r = self._create_draft(client_with_token, social_account, proposed_publish_at=self._WHEN)
+        assert r.status_code == 201, r.content
+        body = r.json()
+        assert body["proposed_publish_at"] == self._WHEN
+        assert Post.objects.get(id=body["id"]).proposed_publish_at is not None
+
+    def test_create_draft_defaults_proposed_to_null(self, client_with_token, social_account):
+        body = self._create_draft(client_with_token, social_account).json()
+        assert body["proposed_publish_at"] is None
+
+    def test_schedule_action_ignores_proposed(self, client_with_token, social_account):
+        when = (timezone.now() + timedelta(hours=3)).isoformat()
+        r = client_with_token.post(
+            "/api/v1/posts/",
+            data=json.dumps(
+                {
+                    "social_account_id": str(social_account.id),
+                    "caption": "hi",
+                    "action": "schedule",
+                    "scheduled_at": when,
+                    "proposed_publish_at": self._WHEN,
+                }
+            ),
+            content_type="application/json",
+        )
+        assert r.status_code == 201, r.content
+        # A scheduled post carries a real time, not a proposal.
+        assert r.json()["proposed_publish_at"] is None
+
+    def test_retrieve_returns_proposed(self, client_with_token, social_account):
+        pid = self._create_draft(client_with_token, social_account, proposed_publish_at=self._WHEN).json()["id"]
+        body = client_with_token.get(f"/api/v1/posts/{pid}").json()
+        assert body["proposed_publish_at"] == self._WHEN
+
+    def test_patch_sets_proposed(self, client_with_token, social_account):
+        pid = self._create_draft(client_with_token, social_account).json()["id"]
+        r = client_with_token.patch(
+            f"/api/v1/posts/{pid}",
+            data=json.dumps({"proposed_publish_at": self._WHEN}),
+            content_type="application/json",
+        )
+        assert r.status_code == 200, r.content
+        assert r.json()["proposed_publish_at"] == self._WHEN
+
+    def test_schedule_route_clears_proposed(self, client_with_token, social_account):
+        pid = self._create_draft(client_with_token, social_account, proposed_publish_at=self._WHEN).json()["id"]
+        when = (timezone.now() + timedelta(hours=3)).isoformat()
+        r = client_with_token.post(
+            f"/api/v1/posts/{pid}/schedule",
+            data=json.dumps({"scheduled_at": when}),
+            content_type="application/json",
+        )
+        assert r.status_code == 200, r.content
+        body = r.json()
+        assert body["scheduled_at"] is not None
+        # A committed schedule supersedes the proposal — they never coexist.
+        assert body["proposed_publish_at"] is None
+
+    def test_patch_proposed_on_scheduled_post_is_dropped(self, client_with_token, social_account):
+        when = (timezone.now() + timedelta(hours=3)).isoformat()
+        pid = client_with_token.post(
+            "/api/v1/posts/",
+            data=json.dumps(
+                {
+                    "social_account_id": str(social_account.id),
+                    "caption": "hi",
+                    "action": "schedule",
+                    "scheduled_at": when,
+                }
+            ),
+            content_type="application/json",
+        ).json()["id"]
+        r = client_with_token.patch(
+            f"/api/v1/posts/{pid}",
+            data=json.dumps({"proposed_publish_at": self._WHEN}),
+            content_type="application/json",
+        )
+        assert r.status_code == 200, r.content
+        body = r.json()
+        assert body["scheduled_at"] is not None
+        assert body["proposed_publish_at"] is None

@@ -758,7 +758,7 @@ When a post type is selected, the composer adapts its fields:
 - "Add to Queue" - adds the post to the next available slot in the selected queue (see F-2.3). Visible if queues are configured.
 
 ### Data Model
-- `Post`: id, workspace_id, author_id, status (enum: draft, pending_review, pending_client, approved, scheduled, publishing, published, partially_published, failed), caption (text), first_comment (text), category_id (nullable), tags (json array of strings), internal_notes (text), template_source_id (nullable), scheduled_at (datetime, nullable), published_at (datetime, nullable), created_at, updated_at.
+- `Post`: id, workspace_id, author_id, status (enum: draft, pending_review, pending_client, approved, scheduled, publishing, published, partially_published, failed), caption (text), first_comment (text), category_id (nullable), tags (json array of strings), internal_notes (text), template_source_id (nullable), scheduled_at (datetime, nullable), published_at (datetime, nullable), proposed_publish_at (datetime, nullable — optional draft-stage suggested publish time, distinct from scheduled_at), created_at, updated_at.
 - `PlatformPost`: id, post_id, social_account_id, platform_specific_caption (text, nullable - null means use base caption), platform_specific_media (json, nullable), platform_specific_first_comment (text, nullable), platform_post_id (string, nullable - populated after publish), publish_status (enum: pending, published, failed), publish_error (text, nullable), published_at (datetime, nullable).
 - `PostMedia`: id, post_id, media_asset_id, position (integer, for ordering), alt_text (text, nullable), platform_overrides (json - e.g., {"instagram": {"crop": "4:5"}}).
 - `PostVersion`: id, post_id, version_number (integer), snapshot (json - full post state at time of save), created_by, created_at.
@@ -1080,7 +1080,7 @@ The backend system responsible for sending posts to social media platforms at th
   - Facebook: 200 API calls per hour per user token. 4,800 posts per 24 hours per page.
   - LinkedIn: 100 API calls per day per member for posting. Company pages: 100 shares per day.
   - TikTok: Varies by app review tier. Default: 5 videos per day.
-  - YouTube: 10,000 quota units per day (video upload = 1,600 units).
+  - YouTube: per Google Cloud project, reset at midnight US/Pacific: 100 `videos.insert` (upload) calls and 100 `search.list` calls per day, each in its own bucket at 1 unit per call, plus 10,000 units per day for every other method (custom thumbnail and comment = 50 units each).
   - Pinterest: 1,000 API calls per hour.
   - Bluesky: 5,000 actions per hour, 35,000 per day per account.
   - Mastodon: Varies by instance. Typical: 300 posts per 3 hours.
