@@ -25,12 +25,14 @@ from datetime import timedelta
 
 from background_task import background
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import F
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.common.db import in_worker_thread, release_idle_connection
+from apps.common.worker import SHUTDOWN_REQUESTED
 from apps.composer.models import PlatformPost
 from apps.composer.services import publish_blocker, usable_media_types
 from apps.credentials.models import resolve_platform_credentials
@@ -105,6 +107,10 @@ def _resolve_publish_credentials(account):
         credentials["page_id"] = account.account_platform_id
     elif platform in ("instagram", "instagram_login"):
         credentials["ig_user_id"] = account.account_platform_id
+        if platform == "instagram":
+            credentials["page_id"] = account.webhook_target_id
+            credentials["missing_scopes"] = account.missing_scopes
+            credentials["messaging_access"] = account.messaging_access
         # The comment poll and the first-comment reconciliation both match our
         # own comments on handle as well as id: Instagram often returns a
         # comment's ``username`` without a ``from`` object, and an unrecognised
@@ -320,12 +326,39 @@ def _provider_and_access_token(account):
     access_token = account.oauth_access_token
     if account.token_expires_within(_PUBLISH_REFRESH_WINDOW) and account.oauth_refresh_token:
         try:
-            access_token = account.refresh_oauth_token(provider)
+            access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
             logger.info("Refreshed token for %s", account)
         except Exception:
             logger.exception("Token refresh failed for %s", account)
 
     return provider, access_token
+
+
+class _ProviderUploadCache:
+    """The :class:`providers.types.UploadCache` the engine hands to providers.
+
+    Backed by the default cache (Redis in production, so it survives a worker
+    restart). Best-effort both ways: a cache outage costs a re-upload, never
+    a publish.
+    """
+
+    PREFIX = "provider-upload:"
+
+    def get(self, key: str) -> str | None:
+        try:
+            return cache.get(self.PREFIX + key)
+        except Exception:
+            logger.warning("Provider upload cache read failed", exc_info=True)
+            return None
+
+    def set(self, key: str, value: str, timeout: int) -> None:
+        try:
+            cache.set(self.PREFIX + key, value, timeout)
+        except Exception:
+            logger.warning("Provider upload cache write failed", exc_info=True)
+
+
+_provider_upload_cache = _ProviderUploadCache()
 
 
 @contextlib.contextmanager
@@ -850,6 +883,11 @@ class PublishEngine:
                 extra=extra,
                 link_url=link_url,
                 video_duration_sec=primary_video_duration,
+                # Stable per PlatformPost, so every retry of this row sends the
+                # same key; a clone or a new post is a new row and a new key.
+                idempotency_key=f"brightbean-{platform_post.id}",
+                upload_cache=_provider_upload_cache,
+                should_stop=SHUTDOWN_REQUESTED.is_set,
             )
 
             logger.info(

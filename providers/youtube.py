@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode, urlsplit
 
 import httpx
 
 from .base import SocialProvider
-from .exceptions import OAuthError, ProviderError, PublishError, QuotaExceededError, TokenExpiredError
+from .exceptions import APIError, OAuthError, ProviderError, PublishError, QuotaExceededError, TokenExpiredError
 from .google_errors import (
     AUTH_REASONS,
     QUOTA_REASONS,
@@ -257,7 +258,7 @@ class YouTubeProvider(SocialProvider):
     # Profile
     # ------------------------------------------------------------------
 
-    def get_profile(self, access_token: str) -> AccountProfile:
+    def get_profile(self, access_token: str, *, channel_id: str | None = None) -> AccountProfile:
         resp = self._request(
             "GET",
             f"{API_BASE}/channels",
@@ -269,7 +270,21 @@ class YouTubeProvider(SocialProvider):
         if not items:
             return AccountProfile(platform_id="", name="Unknown")
 
-        channel = items[0]
+        if channel_id:
+            while not any(item.get("id") == channel_id for item in items) and body.get("nextPageToken"):
+                resp = self._request(
+                    "GET",
+                    f"{API_BASE}/channels",
+                    access_token=access_token,
+                    params={"part": "snippet,statistics", "mine": "true", "pageToken": body["nextPageToken"]},
+                )
+                body = resp.json()
+                items = body.get("items", [])
+            channel = next((item for item in items if item.get("id") == channel_id), None)
+            if channel is None:
+                return AccountProfile(platform_id="", name="Unknown")
+        else:
+            channel = items[0]
         snippet = channel.get("snippet", {})
         stats = channel.get("statistics", {})
         thumbnails = snippet.get("thumbnails", {})
@@ -386,7 +401,9 @@ class YouTubeProvider(SocialProvider):
             return PublishResult(
                 platform_post_id=video_id,
                 url=f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
-                extra=upload_body,
+                # The ID above is sufficient. Persisting the resource here
+                # also copies it into composer settings, clones and history.
+                extra={},
             )
 
         raise PublishError(
@@ -434,6 +451,8 @@ class YouTubeProvider(SocialProvider):
         *,
         deep: bool = False,
         page_token: str | None = None,
+        channel_id: str | None = None,
+        stored_reply_counts: Callable[[list[str]], Mapping[str, int]] | None = None,
     ) -> YouTubeMessageBatch:
         """Comment threads on this channel, newest first.
 
@@ -464,25 +483,38 @@ class YouTubeProvider(SocialProvider):
         whose top-level comment predates ``since`` can still carry a reply
         posted seconds ago, so skipping the whole thread — as this did — lost
         the reply with it.
+
+        ``channel_id`` is the channel stored at connect time. Passing it skips
+        the ``channels.list`` lookup, which was half of every routine poll's
+        cost for an answer that never changes. Without it the lookup still
+        runs, for a row that predates the stored id.
+
+        ``stored_reply_counts`` is asked, once per page, how many replies are
+        already stored for the threads on that page that YouTube only partly
+        embeds. A history walk otherwise fetches every reply page of every such
+        thread, even one the previous sweep imported in full. A thread is
+        skipped only when the stored count *equals* ``totalReplyCount``: a
+        higher stored count means replies were deleted upstream and may hide a
+        new one, so it is fetched. Embedded replies are always read.
         """
-        # Counted before the call, not after, so a request that raises still
-        # shows up in the tally — and counted with ``+=`` so an auth retry adds
-        # to what the first attempt bought instead of replacing it. A refusal on
-        # quota is not charged upstream, so this is a ceiling on the real spend,
-        # which is the safe direction to be wrong in. See
-        # SocialProvider.last_call_quota_units.
-        self.last_call_quota_units += 1
-        # Resolve channel ID
-        ch_resp = self._request(
-            "GET",
-            f"{API_BASE}/channels",
-            access_token=access_token,
-            params={"part": "id", "mine": "true"},
-        )
-        ch_items = ch_resp.json().get("items", [])
-        if not ch_items:
-            return YouTubeMessageBatch([])
-        channel_id = ch_items[0]["id"]
+        if not channel_id:
+            # Counted before the call, not after, so a request that raises
+            # still shows up in the tally — and counted with ``+=`` so an auth
+            # retry adds to what the first attempt bought instead of replacing
+            # it. A refusal on quota is not charged upstream, so this is a
+            # ceiling on the real spend, which is the safe direction to be
+            # wrong in. See SocialProvider.last_call_quota_units.
+            self.last_call_quota_units += 1
+            ch_resp = self._request(
+                "GET",
+                f"{API_BASE}/channels",
+                access_token=access_token,
+                params={"part": "id", "mine": "true"},
+            )
+            ch_items = ch_resp.json().get("items", [])
+            if not ch_items:
+                return YouTubeMessageBatch([])
+            channel_id = ch_items[0]["id"]
 
         # How far back a page may reach before paging stops. ``None`` means "no
         # floor" — a first sync (no ``since``) and the deep sweep both want the
@@ -520,6 +552,18 @@ class YouTubeProvider(SocialProvider):
             # page reached.
             oldest_on_page: datetime | None = None
 
+            # Threads YouTube only partly embedded. Looked up per page so a
+            # walk capped at a few pages never loads the whole history's counts.
+            stored_counts: Mapping[str, int] = {}
+            if (deep or since is None) and stored_reply_counts is not None:
+                partial = [
+                    thread["snippet"]["topLevelComment"]["id"]
+                    for thread in body.get("items", [])
+                    if thread["snippet"].get("totalReplyCount", 0) > len(thread.get("replies", {}).get("comments", []))
+                ]
+                if partial:
+                    stored_counts = stored_reply_counts(partial)
+
             for thread in body.get("items", []):
                 top_snippet = thread["snippet"]["topLevelComment"]["snippet"]
                 published = datetime.fromisoformat(top_snippet["publishedAt"].replace("Z", "+00:00"))
@@ -550,7 +594,9 @@ class YouTubeProvider(SocialProvider):
                 # A full history walk must fetch the rest or its new replies to
                 # old threads can remain invisible despite reaching the thread.
                 replies = thread.get("replies", {}).get("comments", [])
-                if (deep or since is None) and thread["snippet"].get("totalReplyCount", 0) > len(replies):
+                total_replies = thread["snippet"].get("totalReplyCount", 0)
+                already_stored = stored_counts.get(top_comment_id) == total_replies
+                if (deep or since is None) and total_replies > len(replies) and not already_stored:
                     replies = self._all_comment_replies(access_token, top_comment_id)
                 for reply in replies:
                     r_snippet = reply["snippet"]
@@ -773,8 +819,95 @@ class YouTubeProvider(SocialProvider):
             engagements=likes + comments,
             extra={
                 "favorite_count": int(stats.get("favoriteCount", 0)),
+                "reported_metrics": {
+                    key: float(stats[api_key])
+                    for api_key, key in (("viewCount", "views"), ("likeCount", "likes"), ("commentCount", "comments"))
+                    if api_key in stats
+                },
             },
         )
+
+    def get_comments_by_id(self, access_token, comment_ids):
+        """Refresh retained comments, including replies and edited text."""
+        result = {}
+        for offset in range(0, len(comment_ids), 50):
+            ids = comment_ids[offset : offset + 50]
+            try:
+                response = self._request(
+                    "GET",
+                    f"{API_BASE}/comments",
+                    access_token=access_token,
+                    params={"part": "snippet", "id": ",".join(ids), "textFormat": "plainText"},
+                )
+            except APIError as exc:
+                if exc.status_code != 404:
+                    raise
+                # A single missing ID can fail the whole batch. Isolate it;
+                # never delete every other comment based on that one 404.
+                if len(ids) > 1:
+                    split = len(ids) // 2
+                    result.update(self.get_comments_by_id(access_token, ids[:split]))
+                    result.update(self.get_comments_by_id(access_token, ids[split:]))
+                continue
+            result.update({item["id"]: item.get("snippet", {}) for item in response.json().get("items", [])})
+        return result
+
+    _CHANNEL_METRICS = {
+        "views": "views",
+        "likes": "likes",
+        "comments": "comments",
+        "shares": "shares",
+        "estimatedMinutesWatched": "watch_time",
+        "averageViewPercentage": "avg_view_pct",
+        "subscribersGained": "subscribers",
+    }
+
+    def _channel_report(self, access_token, channel_id, start, end, *, daily=False):
+        """Parse columns by name; only returned numeric cells are observations."""
+        import math
+        from datetime import date
+
+        params = {
+            "ids": f"channel=={channel_id}",
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "metrics": ",".join(self._CHANNEL_METRICS),
+        }
+        if daily:
+            params.update(dimensions="day", sort="day", maxResults=200)
+        result = []
+        while True:
+            body = self._request("GET", f"{ANALYTICS_BASE}/reports", access_token=access_token, params=params).json()
+            columns = [h.get("name") for h in body.get("columnHeaders", [])]
+            rows = body.get("rows", [])
+            for cells in rows:
+                record = dict(zip(columns, cells, strict=False))
+                metrics = {}
+                for api_key, key in self._CHANNEL_METRICS.items():
+                    value = record.get(api_key)
+                    if value is not None:
+                        try:
+                            number = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(number):
+                            metrics[key] = number
+                if daily:
+                    if record.get("day"):
+                        day = date.fromisoformat(record["day"])
+                        if start <= day <= end:
+                            result.append({"date": day, "metrics": metrics})
+                else:
+                    return metrics
+            if not daily or len(rows) < 200:
+                return result if daily else {}
+            params["startIndex"] = params.get("startIndex", 1) + len(rows)
+
+    def get_channel_daily_metrics(self, access_token, channel_id, start, end):
+        return self._channel_report(access_token, channel_id, start, end, daily=True)
+
+    def get_channel_period_metrics(self, access_token, channel_id, start, end):
+        return self._channel_report(access_token, channel_id, start, end)
 
     def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
         """Channel-level metrics from the YouTube Analytics API.
@@ -950,6 +1083,8 @@ class YouTubeProvider(SocialProvider):
                         shares_value = None
 
                 if extra or shares_value is not None:
+                    if shares_value is not None:
+                        extra["reported_metrics"] = {"shares": shares_value}
                     result[video_id] = PostMetrics(shares=shares_value or 0, extra=extra)
         return result
 
@@ -962,9 +1097,10 @@ class YouTubeProvider(SocialProvider):
             self._request(
                 "POST",
                 REVOKE_URL,
-                params={"token": access_token},
+                data={"token": access_token},
+                timeout=5,
             )
             return True
         except Exception:
-            logger.exception("Failed to revoke YouTube token")
+            logger.warning("YouTube revocation deferred; retry via encrypted outbox")
             return False

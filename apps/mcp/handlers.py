@@ -216,6 +216,7 @@ register_tool(
         ),
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_list_accounts,
+        read_only=True,
     )
 )
 
@@ -424,6 +425,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_post,
+        read_only=True,
     )
 )
 
@@ -512,6 +514,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_list_posts,
+        read_only=True,
     )
 )
 
@@ -759,6 +762,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_search_media,
+        read_only=True,
     )
 )
 
@@ -793,6 +797,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_media,
+        read_only=True,
     )
 )
 
@@ -1150,6 +1155,9 @@ register_tool(
             "``series`` is the daily sparkline. Metrics with ``calculated_by_brightbean: true`` (the "
             "engagement rate, daily averages, estimates) and every ``delta`` are calculated by BrightBean, "
             "not reported by the platform; say so when showing them to a user. Includes ``captured_at`` and ``next_sync_eta`` "
+            "YouTube uses native period reports, separate raw count cards, ``engagement: null``, Pacific reporting-period metadata "
+            "and ``comparison_available``. Missing numeric metrics are omitted and daily gaps remain null. "
+            "Disclosure alone does not permit additional derived YouTube analytics. "
             "so an agent can pick a sensible poll delay. Platforms without an analytics surface "
             "(LinkedIn Personal, Bluesky, Mastodon) return ``analytics_available: false`` with "
             "``unavailable_reason``. Requires the view_analytics permission."
@@ -1174,6 +1182,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_account_analytics,
+        read_only=True,
     )
 )
 
@@ -1225,6 +1234,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_post_analytics,
+        read_only=True,
     )
 )
 
@@ -1372,6 +1382,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_list_inbox_messages,
+        read_only=True,
     )
 )
 
@@ -1404,6 +1415,7 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_inbox_message,
+        read_only=True,
     )
 )
 
